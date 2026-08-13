@@ -907,6 +907,17 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # b12x CE-DMA all-reduce for PCIe-only SM120/SM121. Off by default so
+    # serving stays on NCCL unless an A/B run opts in.
+    SGLANG_OPT_USE_B12X_PCIE_DMA = EnvBool(False)
+    # Unset: graph autotune or cache. Size string: pin. off: disable.
+    SGLANG_B12X_PCIE_DMA_MIN_BYTES = EnvStr(None)
+    SGLANG_B12X_PCIE_DMA_MAX_BYTES = EnvInt(64 * 1024 * 1024)
+    # Forwarded to DmaAllReduce(fp8=...). Empty = lossless.
+    SGLANG_B12X_PCIE_DMA_FP8 = EnvStr("")
+    # Empty = $SGLANG_CACHE_DIR/b12x_pcie_dma.json
+    SGLANG_B12X_PCIE_DMA_CACHE = EnvStr("")
+    SGLANG_B12X_PCIE_DMA_FORCE_AUTOTUNE = EnvBool(False)
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
     # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
     # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the

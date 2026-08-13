@@ -312,6 +312,7 @@ class GroupCoordinator:
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
+    b12x_dma_comm: Optional[Any]  # b12x PCIe DMA allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
@@ -461,6 +462,9 @@ class GroupCoordinator:
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # Lazy import to avoid documentation build error
+        from sglang.srt.distributed.device_communicators import (
+            b12x_pcie_dma_all_reduce as b12x_dma_mod,
+        )
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,
         )
@@ -506,7 +510,19 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
+        self.b12x_dma_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+        if (
+            self.world_size > 1
+            and envs.SGLANG_OPT_USE_B12X_PCIE_DMA.get()
+            and self.unique_name.split(":", 1)[0]
+            in {"tp", "pdmux_prefill_tp", "attention_tp"}
+        ):
+            self.b12x_dma_comm = b12x_dma_mod.create_b12x_pcie_dma_all_reduce(
+                device_group=self.device_group,
+                cpu_group=self.cpu_group,
+                device=self.device,
+            )
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -734,6 +750,13 @@ class GroupCoordinator:
             self._pcie_ipc_off = True
             return None
 
+    def _b12x_pcie_dma_all_reduce(self, input_: torch.Tensor):
+        """Try b12x CE-DMA all-reduce; return None to fall through."""
+        comm = self.b12x_dma_comm
+        if comm is None:
+            return None
+        return comm.try_all_reduce(input_)
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -785,6 +808,10 @@ class GroupCoordinator:
         pcie_ipc_out = self._pcie_ipc_all_reduce(input_)
         if pcie_ipc_out is not None:
             return pcie_ipc_out
+
+        dma_out = self._b12x_pcie_dma_all_reduce(input_)
+        if dma_out is not None:
+            return dma_out
 
         if torch.compiler.is_compiling():
             if self._can_use_flashinfer_allreduce(input_):
@@ -1931,6 +1958,9 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.b12x_dma_comm is not None:
+            self.b12x_dma_comm.close()
+            self.b12x_dma_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
