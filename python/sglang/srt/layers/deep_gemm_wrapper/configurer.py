@@ -18,15 +18,18 @@ def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
-    # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
-    if sm_version == 120:
-        return False
     if not (_is_cuda or _is_musa):
         return False
 
     try:
-        import deep_gemm  # noqa: F401
+        import deep_gemm
     except ImportError:
+        return False
+
+    # SM120 support uses a separate mma.sync block-scale implementation.
+    if sm_version == 120 and not hasattr(
+        deep_gemm, "m_grouped_fp8_fp4_gemm_nt_contiguous"
+    ):
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
@@ -34,6 +37,13 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
+
+def _compute_scale_ue8m0():
+    return ENABLE_JIT_DEEPGEMM and (
+        is_sm100_supported() or get_device_sm() == 120
+    )
+
+
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
-DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
+DEEPGEMM_SCALE_UE8M0 = _compute_scale_ue8m0()
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
