@@ -94,7 +94,32 @@ _PCIE_IPC_ALL_REDUCE = os.environ.get(
 # and sit inside the range #4393 benchmarked (<= ~1.5 MB); prefill reaches
 # ~112 MB, two orders of magnitude beyond it, so the default keeps prefill on
 # the existing path rather than assuming those speedups extrapolate.
+
 _PCIE_IPC_MAX_NUMEL = int(os.environ.get("SGLANG_PCIE_IPC_MAX_NUMEL", 1 << 21))
+
+def _preload_pcie_ipc_comm_module() -> None:
+    """Bind PCIe-IPC and its CUDA runtime before TileLang loads CUDA stubs."""
+    if not _PCIE_IPC_ALL_REDUCE:
+        return
+
+    try:
+        from flashinfer.comm.cuda_ipc import cudart
+        from flashinfer.comm.pcie_ipc_ar import get_pcie_ipc_comm_module
+
+        get_pcie_ipc_comm_module()
+        # FlashInfer discovers libcudart through /proc/self/maps on first use.
+        # Cache the real runtime now so TileLang's libcudart_stub.so cannot be
+        # mistaken for libcudart when the workspace is allocated later.
+        cudart.cudaSetDevice(torch.cuda.current_device())
+    except Exception as exc:  # noqa: BLE001 - runtime path retains its fallback
+        logger.warning(
+            "PCIe-IPC all-reduce module preload failed (%s); "
+            "workspace initialization will retry on first use",
+            exc,
+        )
+        return
+
+    logger.info("Preloaded PCIe-IPC all-reduce module before model initialization")
 
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
@@ -663,9 +688,10 @@ class GroupCoordinator:
     def _pcie_ipc_all_reduce(self, input_: torch.Tensor):
         """Try FlashInfer's PCIe-IPC all-reduce; return None to fall through.
 
-        The workspace is built lazily and keyed by dtype: its buffers are
-        allocated for a single dtype at construction, so a second dtype needs
-        its own workspace rather than a reinterpretation of the first.
+        The workspace is built lazily and keyed by dtype and CUDA stream. Its
+        buffers are allocated for a single dtype, while its epoch and arrival
+        counters require all calls using it to be totally ordered on one
+        stream.
 
         Every failure path returns None so the caller proceeds to the existing
         selection. A backend that cannot serve a shape must not be able to
@@ -681,7 +707,9 @@ class GroupCoordinator:
             cache = {}
             self._pcie_ipc_ws = cache
 
-        ws = cache.get(input_.dtype)
+        current_stream = torch.cuda.current_stream(input_.device)
+        cache_key = (input_.dtype, current_stream.cuda_stream)
+        ws = cache.get(cache_key)
         if ws is None:
             try:
                 from flashinfer.comm.pcie_ipc_ar import PcieIpcAllReduceWorkspace
@@ -695,7 +723,7 @@ class GroupCoordinator:
                 logger.warning("PCIe-IPC all-reduce unavailable (%s); using default path", exc)
                 self._pcie_ipc_off = True
                 return None
-            cache[input_.dtype] = ws
+            cache[cache_key] = ws
 
         try:
             if not ws.supports(input_):
@@ -2469,6 +2497,9 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+    if _TP.world_size > 1:
+        _preload_pcie_ipc_comm_module()
+
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
