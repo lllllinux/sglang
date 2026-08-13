@@ -434,6 +434,20 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+def _apply_sm120_fp8_wo_a_gemm_default() -> None:
+    """Gate the SM120 FP8 W_o_A GEMM override on the DeepGEMM ue8m0 capability.
+
+    Builds that cannot run the GEMM (DEEPGEMM_SCALE_UE8M0 false) get
+    SGLANG_OPT_FP8_WO_A_GEMM forced off. Capable builds are left untouched, so
+    they keep the global default or an explicit setting. The capability check in
+    `_handle_environment_variables` stays authoritative.
+    """
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+
+    if not DEEPGEMM_SCALE_UE8M0:
+        envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -1978,10 +1992,11 @@ class ServerArgs:
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
-                "Requires SM90 or SM10X NVIDIA GPUs. "
+                "Requires SM90, SM10X, or SM12X (SM120/SM121) NVIDIA GPUs. "
                 "Defaults to auto. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
-                "(single- and multi-node) and trtllm on SM90 single-node systems. "
+                "(single- and multi-node) and trtllm on SM90, SM120, and SM121 "
+                "single-node systems. "
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
@@ -5329,15 +5344,23 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_v4_sm120_moe)
             if is_sm120_supported():
-                # SM120 lacks tcgen05/TMEM: disable features that depend on
-                # DeepGEMM or require >99KB SMEM (topk_v2).
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                # Keep the W_o_A DeepGEMM default only when the installed build
+                # supports SM120; disable features that require >99KB SMEM
+                # (topk_v2).
+                _apply_sm120_fp8_wo_a_gemm_default()
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-                # Prefer TileLang over the Torch fallback.
-                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+                if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
+                    envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                # Out of the box the indexer runs the TileLang kernel (works on
+                # stock DeepGEMM); both knobs stay env-overridable so a DeepGEMM
+                # build with SM120 attention support can opt into
+                # fp8_paged_mqa_logits by setting them to 0.
+                if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.is_set():
+                    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
+                    envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)

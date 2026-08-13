@@ -53,7 +53,10 @@ from sglang.srt.layers.dp_attention import (
     is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
 )
-from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
+from sglang.srt.layers.flashinfer_comm_fusion import (
+    FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+    is_flashinfer_allreduce_unavailable,
+)
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
@@ -84,12 +87,14 @@ from sglang.srt.utils import (
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
 )
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
+_is_sm120_supported = _is_cuda and is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
@@ -157,16 +162,11 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
-# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
-
-
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
-        (_is_sm90_supported or _is_sm100_supported)
+        (_is_sm90_supported or _is_sm100_supported or _is_sm120_supported)
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
         and get_exec().comm.flashinfer_allreduce_fusion_backend is not None
@@ -814,6 +814,18 @@ class LayerCommunicator:
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
         # TP_ATTN_FULL size, causing a shape mismatch.
         if is_enable_moe_cp_allgather():
+            return False
+
+        # Fusing makes the next layer's residual+LN absorb the post-experts
+        # all-reduce, and that fused kernel reduces over a single group. Under
+        # hybrid EP+TP the post-experts reduction spans two disjoint groups
+        # (moe_expert_parallel_all_reduce over _MOE_EP, then
+        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
+        # should_skip_post_experts_all_reduce() skips *both* once fusion is
+        # published -- so the fused reduce would cover only half the peers and
+        # silently return under-reduced activations.
+        parallel = get_parallel()
+        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
             return False
 
         if (

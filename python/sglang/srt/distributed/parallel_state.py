@@ -81,6 +81,21 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+# FlashInfer PCIe-IPC all-reduce (flashinfer-ai/flashinfer#4393): a CUDA-IPC
+# all-reduce for intra-node PCIe machines with no NVLink and no multicast.
+# FlashInfer ships the kernels and a workspace API but nothing selects them,
+# so this is the missing consumer. Off by default -- it is only expected to
+# pay on switch-free PCIe topologies, and only at the sizes its policy tables
+# cover.
+_PCIE_IPC_ALL_REDUCE = os.environ.get(
+    "SGLANG_OPT_USE_PCIE_IPC_ALL_REDUCE", "0"
+).lower() in ("1", "true", "yes", "on")
+# Cap on what gets routed through it. DSV4 TP2 decode all-reduces are ~112 KB
+# and sit inside the range #4393 benchmarked (<= ~1.5 MB); prefill reaches
+# ~112 MB, two orders of magnitude beyond it, so the default keeps prefill on
+# the existing path rather than assuming those speedups extrapolate.
+_PCIE_IPC_MAX_NUMEL = int(os.environ.get("SGLANG_PCIE_IPC_MAX_NUMEL", 1 << 21))
+
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
@@ -183,6 +198,22 @@ def outplace_all_reduce(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
+
+
+@register_custom_op(out_shape="tensor")
+def flashinfer_allreduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """FlashInfer kAllReduce over ``group_name``.
+
+    Registered as a custom op so it stays opaque under Dynamo and can run inside
+    piecewise CUDA graphs. Applicability is decided by
+    ``GroupCoordinator._can_use_flashinfer_allreduce`` before the call -- this op
+    has no fallback of its own.
+    """
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._flashinfer_allreduce(tensor)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -291,6 +322,10 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        # Which FlashInfer fusion workspace this group owns, or None when the
+        # group is not eligible for the allreduce-only kAllReduce path. Stamped
+        # by _tag_groups_for_flashinfer_allreduce_only() after group init.
+        self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         if is_cuda_alike():
@@ -625,6 +660,52 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
+    def _pcie_ipc_all_reduce(self, input_: torch.Tensor):
+        """Try FlashInfer's PCIe-IPC all-reduce; return None to fall through.
+
+        The workspace is built lazily and keyed by dtype: its buffers are
+        allocated for a single dtype at construction, so a second dtype needs
+        its own workspace rather than a reinterpretation of the first.
+
+        Every failure path returns None so the caller proceeds to the existing
+        selection. A backend that cannot serve a shape must not be able to
+        break the collective.
+        """
+        if not _PCIE_IPC_ALL_REDUCE or getattr(self, "_pcie_ipc_off", False):
+            return None
+        if input_.numel() > _PCIE_IPC_MAX_NUMEL:
+            return None
+
+        cache = getattr(self, "_pcie_ipc_ws", None)
+        if cache is None:
+            cache = {}
+            self._pcie_ipc_ws = cache
+
+        ws = cache.get(input_.dtype)
+        if ws is None:
+            try:
+                from flashinfer.comm.pcie_ipc_ar import PcieIpcAllReduceWorkspace
+
+                ws = PcieIpcAllReduceWorkspace(
+                    group=self.device_group,
+                    max_numel=_PCIE_IPC_MAX_NUMEL,
+                    dtype=input_.dtype,
+                )
+            except Exception as exc:  # noqa: BLE001 - must never be fatal
+                logger.warning("PCIe-IPC all-reduce unavailable (%s); using default path", exc)
+                self._pcie_ipc_off = True
+                return None
+            cache[input_.dtype] = ws
+
+        try:
+            if not ws.supports(input_):
+                return None
+            return ws.all_reduce(input_)
+        except Exception as exc:  # noqa: BLE001 - must never be fatal
+            logger.warning("PCIe-IPC all-reduce failed (%s); disabling for this group", exc)
+            self._pcie_ipc_off = True
+            return None
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -671,7 +752,16 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
+        # Selection must resolve outside any traced region, for the same
+        # reason the byte-size thresholds below are deferred under Dynamo.
+        pcie_ipc_out = self._pcie_ipc_all_reduce(input_)
+        if pcie_ipc_out is not None:
+            return pcie_ipc_out
+
         if torch.compiler.is_compiling():
+            if self._can_use_flashinfer_allreduce(input_):
+                return flashinfer_allreduce(input_, group_name=self.unique_name)
+
             # Byte-size thresholds in method selection (e.g. `_pick_algo` or
             # `should_mscclpp_allreduce`) would guard on the symbolic token dim
             # and recompile per shape; defer the selection to runtime inside
@@ -722,6 +812,9 @@ class GroupCoordinator:
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
+
+        if self._can_use_flashinfer_allreduce(input_):
+            return flashinfer_allreduce(input_, group_name=self.unique_name)
 
         outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
             input_=input_,
@@ -918,6 +1011,29 @@ class GroupCoordinator:
             # For piecewise cuda graph, we use pynccl outplace allreduce
             return "pynccl"
         return None
+
+    def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
+        if self._fi_workspace_hint is None:
+            return False
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            can_use_flashinfer_allreduce,
+        )
+
+        return can_use_flashinfer_allreduce(
+            input_,
+            use_attn_tp_group=(self._fi_workspace_hint == "attn_tp"),
+            expected_world_size=self.world_size,
+            expected_group_key=(self.device_group, self.cpu_group),
+        )
+
+    def _flashinfer_allreduce(self, input_: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_allreduce as _flashinfer_allreduce_impl,
+        )
+
+        return _flashinfer_allreduce_impl(
+            input_, use_attn_tp_group=(self._fi_workspace_hint == "attn_tp")
+        )
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
@@ -2005,6 +2121,7 @@ _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
 # Read once at import: whether CustomAllReduceV2 is opted in on a multi-node
 # (MNNVL) group. Used on the all_reduce hot path (see GroupCoordinator).
 _CA_V2_MULTINODE = envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
+_ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -2020,6 +2137,41 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+def set_flashinfer_allreduce_only(enable: bool):
+    global _ENABLE_FLASHINFER_ALLREDUCE_ONLY
+    _ENABLE_FLASHINFER_ALLREDUCE_ONLY = enable
+
+
+def _tag_groups_for_flashinfer_allreduce_only():
+    """Stamp _fi_workspace_hint on the group coordinators that own a FlashInfer
+    fusion workspace, so all_reduce() can dispatch to flashinfer_allreduce()
+    without touching the call sites.
+
+    Only two workspaces exist (see ``_get_workspace_manager``): one for
+    attention TP and one for MoE. A group may only be tagged for the workspace
+    that was rendezvoused on its own peers -- reducing over a workspace built
+    for a different set of peers silently returns wrong data.
+
+    - ``_TP`` is deliberately absent: it *is* ``_ATTN_TP`` when
+      ``attn_tp_size == tp_size``, and a strict superset of it otherwise (DP
+      attention), where the attention workspace addresses the wrong peers.
+    - The MoE workspace rendezvouses on the EP group when ``moe_ep_size > 1``
+      and on the MoE-TP group otherwise, so exactly one of ``_MOE_EP`` /
+      ``_MOE_TP`` is eligible. Tagging both makes a MoE-TP allreduce reduce
+      across the EP peers under hybrid EP+TP (e.g. tp=4, ep=2).
+    """
+    if not _ENABLE_FLASHINFER_ALLREDUCE_ONLY:
+        return
+
+    moe_group = _MOE_EP if (_MOE_EP is not None and _MOE_EP.world_size > 1) else _MOE_TP
+    # Attention is tagged last on purpose: when a coordinator backs both roles
+    # (e.g. _ATTN_TP is _MOE_EP is _TP at tp=4, ep=4) either workspace spans the
+    # same peers and is correct, so we just pick one deterministically.
+    for group, hint in ((moe_group, "moe"), (_ATTN_TP, "attn_tp")):
+        if group is not None:
+            group._fi_workspace_hint = hint
 
 
 # TODO: refactor in-tree platforms to get rid of this wrapper
