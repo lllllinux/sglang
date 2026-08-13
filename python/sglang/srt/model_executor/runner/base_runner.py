@@ -271,8 +271,23 @@ class BaseRunner(ABC):
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
         from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
 
+        # Prefill fusion sees the full forward batch. Allocate its maximum
+        # before CUDA graph capture so graph-held workspaces are never replaced.
+        chunked_prefill_size = mr.server_args.chunked_prefill_size
+        if (
+            mr.server_args.enable_dynamic_chunking
+            or chunked_prefill_size is None
+            or chunked_prefill_size <= 0
+        ):
+            prefill_token_capacity = mr.server_args.max_prefill_tokens
+        else:
+            prefill_token_capacity = chunked_prefill_size
+        workspace_token_capacity = max(
+            FUSE_ALLREDUCE_MAX_BATCH_SIZE, prefill_token_capacity or 0
+        )
+
         pre_initialize_workspaces(
-            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+            max_token_num=workspace_token_capacity,
             hidden_dim=mr.model_config.hidden_size,
             dtype=mr.dtype,
         )
