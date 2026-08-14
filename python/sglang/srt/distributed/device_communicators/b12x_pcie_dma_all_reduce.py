@@ -3,7 +3,7 @@
 """b12x CE-DMA all-reduce adapter for PCIe-only SM120/SM121.
 
 Default off. When enabled, ``GroupCoordinator`` constructs one communicator
-per TP group, resolves ``min_bytes`` from env / cache / b12x graph
+per TP group, resolves eager/graph ``min_bytes`` from env, cache, or b12x
 autotune, and dispatches after FlashInfer PCIe-IPC.
 """
 
@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
 _AUTOTUNE_HIDDEN = 4096
 _AUTOTUNE_ELEM_SIZE = 2
+_EXECUTION_MODES = ("eager", "graph")
+ExecutionMode = Literal["eager", "graph"]
 _OFF_VALUES = frozenset({"off", "disabled", "none"})
 _BYTE_SUFFIXES = (
     ("kib", 1024),
@@ -107,14 +110,29 @@ def _cache_key(
     wire_mode: str,
     max_bytes: int,
     gpus: list[dict[str, str]],
+    execution_mode: ExecutionMode,
 ) -> dict[str, Any]:
+    try:
+        nccl_version = str(torch.cuda.nccl.version())
+    except Exception:
+        nccl_version = "unknown"
     return {
         "world_size": world_size,
         "dtype": "bfloat16",
         "wire_mode": wire_mode,
         "max_bytes": max_bytes,
+        "hidden_size": _AUTOTUNE_HIDDEN,
         "gpus": gpus,
         "b12x_version": _b12x_version(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "nccl_version": nccl_version,
+        "comm_env": {
+            key: value
+            for key, value in sorted(os.environ.items())
+            if key.startswith(("NCCL_", "B12X_PCIE_DMA_"))
+        },
+        "execution_mode": execution_mode,
     }
 
 
@@ -181,17 +199,24 @@ def _pinned_min_bytes() -> tuple[str, Optional[int]]:
 class B12xPcieDmaAllReduce:
     """Thin wrapper around ``b12x.comm.pcie.DmaAllReduce``."""
 
-    def __init__(self, dma: Any) -> None:
+    def __init__(self, dma: Any, min_bytes: dict[ExecutionMode, int]) -> None:
         self._dma = dma
+        self._min_bytes = min_bytes
         self._disabled = False
 
     def try_all_reduce(self, input_: torch.Tensor) -> Optional[torch.Tensor]:
         if self._disabled or self._dma is None:
             return None
         try:
-            if not self._dma.should_allreduce(input_):
+            execution_mode: ExecutionMode = (
+                "graph" if torch.cuda.is_current_stream_capturing() else "eager"
+            )
+            min_bytes = self._min_bytes.get(execution_mode)
+            if min_bytes is None:
                 return None
-            return self._dma.all_reduce(input_)
+            if not self._dma.should_allreduce(input_, min_bytes=min_bytes):
+                return None
+            return self._dma.all_reduce(input_, min_bytes=min_bytes)
         except Exception as exc:  # noqa: BLE001 - must never be fatal
             logger.warning(
                 "b12x PCIe DMA all-reduce failed (%s); disabling for this group",
@@ -208,7 +233,9 @@ class B12xPcieDmaAllReduce:
             dma.close()
 
 
-def _autotune_min_bytes(dma: Any, device_group: ProcessGroup) -> int:
+def _autotune_min_bytes(
+    dma: Any, device_group: ProcessGroup, execution_mode: ExecutionMode
+) -> int:
     from b12x.comm.pcie import autotune_dma_crossovers
 
     max_rows = max(1, dma.max_bytes // (_AUTOTUNE_HIDDEN * _AUTOTUNE_ELEM_SIZE))
@@ -218,6 +245,7 @@ def _autotune_min_bytes(dma: Any, device_group: ProcessGroup) -> int:
         device_group,
         hidden_size=_AUTOTUNE_HIDDEN,
         max_rows=max_rows,
+        execution_mode=execution_mode,
     )
     return int(dma.min_bytes)
 
@@ -230,18 +258,19 @@ def _resolve_min_bytes(
     device: torch.device,
     policy: str,
     pinned: Optional[int],
-) -> str:
+    execution_mode: ExecutionMode,
+    gpus: list[dict[str, str]],
+) -> tuple[int, str]:
     if policy == "pin":
         assert pinned is not None
-        dma.min_bytes = pinned
-        return "env"
+        return pinned, "env"
 
-    gpus = _gather_gpu_inventory(cpu_group, device)
     key = _cache_key(
         world_size=dma.world_size,
         wire_mode=dma.wire_mode,
         max_bytes=dma.max_bytes,
         gpus=gpus,
+        execution_mode=execution_mode,
     )
     use_cache = not envs.SGLANG_B12X_PCIE_DMA_FORCE_AUTOTUNE.get()
     cached: Optional[int] = None
@@ -256,13 +285,29 @@ def _resolve_min_bytes(
     dist.broadcast(payload, src=src_rank, group=cpu_group)
     cached_value = int(payload.item())
     if use_cache and cached_value >= 0:
-        dma.min_bytes = cached_value
-        return "cache"
+        return cached_value, "cache"
 
-    _autotune_min_bytes(dma, device_group)
+    min_bytes = _autotune_min_bytes(dma, device_group, execution_mode)
     if dist.get_rank(cpu_group) == 0:
-        _store_cached_min_bytes(key, int(dma.min_bytes))
-    return "autotune"
+        _store_cached_min_bytes(key, min_bytes)
+    return min_bytes, "autotune"
+
+
+def _required_execution_modes(cuda_graph_config: Any = None) -> tuple[ExecutionMode, ...]:
+    if cuda_graph_config is None:
+        try:
+            from sglang.srt.runtime_context import get_exec
+
+            cuda_graph_config = get_exec().graph.cuda_graph_config
+        except Exception:
+            return _EXECUTION_MODES
+
+    graph_enabled = any(
+        getattr(getattr(cuda_graph_config, phase), "backend", "disabled")
+        != "disabled"
+        for phase in ("decode", "prefill")
+    )
+    return _EXECUTION_MODES if graph_enabled else ("eager",)
 
 
 def create_b12x_pcie_dma_all_reduce(
@@ -330,20 +375,34 @@ def create_b12x_pcie_dma_all_reduce(
         return None
 
     assert dma is not None
-    source = "env"
-    try:
-        source = _resolve_min_bytes(
-            dma,
-            device_group=device_group,
-            cpu_group=cpu_group,
-            device=device,
-            policy=policy,
-            pinned=pinned,
-        )
-    except Exception as exc:  # noqa: BLE001 - fail closed
-        error = exc
+    min_bytes_by_mode: dict[ExecutionMode, int] = {}
+    source_by_mode: dict[ExecutionMode, str] = {}
+    modes = _EXECUTION_MODES if policy == "pin" else _required_execution_modes()
+    gpus = _gather_gpu_inventory(cpu_group, device) if policy == "auto" else []
+    for execution_mode in modes:
+        mode_error: Optional[BaseException] = None
+        try:
+            min_bytes, source = _resolve_min_bytes(
+                dma,
+                device_group=device_group,
+                cpu_group=cpu_group,
+                device=device,
+                policy=policy,
+                pinned=pinned,
+                execution_mode=execution_mode,
+                gpus=gpus,
+            )
+            min_bytes_by_mode[execution_mode] = min_bytes
+            source_by_mode[execution_mode] = source
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            mode_error = exc
+        if _group_failed(device_group, device, mode_error is not None):
+            error = mode_error or RuntimeError(
+                f"peer rank failed {execution_mode} b12x PCIe DMA autotune"
+            )
+            break
 
-    if _group_failed(device_group, device, error is not None):
+    if error is not None:
         dma.close()
         logger.warning(
             "b12x PCIe DMA autotune failed (rank %d error: %s); "
@@ -355,14 +414,14 @@ def create_b12x_pcie_dma_all_reduce(
 
     if dist.get_rank(device_group) == 0:
         logger.info(
-            "b12x PCIe DMA all-reduce ready: min_bytes=%d max_bytes=%d "
+            "b12x PCIe DMA all-reduce ready: min_bytes=%s max_bytes=%d "
             "wire=%s source=%s",
-            dma.min_bytes,
+            min_bytes_by_mode,
             dma.max_bytes,
             dma.wire_mode,
-            source,
+            source_by_mode,
         )
-    return B12xPcieDmaAllReduce(dma)
+    return B12xPcieDmaAllReduce(dma, min_bytes_by_mode)
 
 
 def _group_failed(
@@ -405,15 +464,14 @@ def _run_cli() -> None:
 
     dma = comm._dma
     if dist.get_rank() == 0:
-        print(f"dma_min_bytes={dma.min_bytes}")
+        print(f"dma_min_bytes={comm._min_bytes}")
         print(f"dma_max_bytes={dma.max_bytes}")
         print(f"wire_mode={dma.wire_mode}")
         print(f"cache={_cache_path()}")
-        if dma.min_bytes > dma.max_bytes:
+        if all(value > dma.max_bytes for value in comm._min_bytes.values()):
             print("export SGLANG_B12X_PCIE_DMA_MIN_BYTES=off")
         else:
             print("export SGLANG_OPT_USE_B12X_PCIE_DMA=1")
-            print(f"export SGLANG_B12X_PCIE_DMA_MIN_BYTES={dma.min_bytes}")
     comm.close()
     dist.destroy_process_group(cpu_group)
     dist.destroy_process_group()

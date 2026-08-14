@@ -910,7 +910,7 @@ class Envs:
     # b12x CE-DMA all-reduce for PCIe-only SM120/SM121. Off by default so
     # serving stays on NCCL unless an A/B run opts in.
     SGLANG_OPT_USE_B12X_PCIE_DMA = EnvBool(False)
-    # Unset: graph autotune or cache. Size string: pin. off: disable.
+    # Unset: eager/graph autotune or mode-specific cache. Size: pin both modes.
     SGLANG_B12X_PCIE_DMA_MIN_BYTES = EnvStr(None)
     SGLANG_B12X_PCIE_DMA_MAX_BYTES = EnvInt(64 * 1024 * 1024)
     # Forwarded to DmaAllReduce(fp8=...). Empty = lossless.
