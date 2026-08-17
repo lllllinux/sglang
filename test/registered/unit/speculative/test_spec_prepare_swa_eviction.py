@@ -33,9 +33,8 @@ class TestSpecPrepareSwaEviction(CustomTestCase):
         from sglang.srt.speculative import spec_utils
 
         with patch.object(
-            spec_utils, "get_server_args", return_value=MagicMock()
-        ) as server_args:
-            server_args.return_value.enable_mamba_extra_buffer_lazy.return_value = False
+            spec_utils, "mamba_extra_buffer_lazy_enabled", return_value=False
+        ):
             spec_utils.spec_prepare_for_decode(batch)
 
     def test_dflash_family_evicts_and_ticks(self):
