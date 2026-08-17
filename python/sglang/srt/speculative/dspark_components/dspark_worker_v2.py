@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
@@ -53,6 +54,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -65,7 +67,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_cuda_alike
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +99,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
-            not server_args.disable_cuda_graph and not self._is_pd_prefill
+            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            and not self._is_pd_prefill
         )
         if (
             server_args.enable_dp_attention
@@ -153,6 +156,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
+        parallel = get_parallel()
+        self._tp_sync = DsparkTpSync(
+            parallel.attn_tp_group
+            if server_args.enable_dp_attention
+            else parallel.tp_group
+        )
+        self._draft_graph_group = (
+            parallel.attn_tp_group
+            if self._draft_dp_context_enabled
+            else parallel.tp_group
+        )
+
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
@@ -192,6 +207,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
+            tp_sync=self._tp_sync,
         )
         if (
             server_args.enable_dp_attention
@@ -220,6 +236,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
+            tp_sync=self._tp_sync,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
         )
         self._verify_epilogue = None
@@ -232,6 +249,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
+                tp_sync=self._tp_sync,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -270,6 +288,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
+            tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
         )
@@ -339,8 +358,17 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = self._decode_graph_allowed
-        if is_cuda() and capture_decode_cuda_graph:
-            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        available_mem = None
+        if is_cuda_alike() and capture_decode_cuda_graph:
+            graph_group = self._draft_graph_group
+            available_mem = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=graph_group.world_size > 1,
+                cpu_group=(
+                    graph_group.cpu_group if graph_group.world_size > 1 else None
+                ),
+            )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -357,7 +385,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                    self._draft_sampler = self._maybe_build_draft_sampler()
+                    self._draft_sampler = self._maybe_build_draft_sampler(
+                        available_memory_gb=available_mem
+                    )
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
@@ -367,13 +397,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self):
+    def _maybe_build_draft_sampler(self, *, available_memory_gb: Optional[float]):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self.ps.tp_rank,
+            tp_sync=self._tp_sync,
+            available_memory_gb=available_memory_gb,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence
@@ -438,6 +470,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
+        self._tp_sync.sync(next_token_ids)
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)

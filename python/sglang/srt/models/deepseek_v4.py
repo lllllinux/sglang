@@ -29,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
@@ -206,7 +207,22 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+
+
+@functools.lru_cache(maxsize=1)
+def _wo_a_ue8m0_sm12x() -> bool:
+    """sm12x needs ue8m0 scales for wo_a; the global flag only covers sm100."""
+    if not _FP8_WO_A_GEMM:
+        return False
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        return False
+    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and is_sm120_supported()
+
+
 _MHC_POST_MULT_VALUE = 2.0
+_HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -591,7 +607,7 @@ class MqaAttentionBase(nn.Module):
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
             self.wo_a.weight_scale_inv.format_ue8m0 = (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x()
             )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -1271,12 +1287,19 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
+        # Above this the SM120 route is the prefill kernel, which takes
+        # arbitrary h_q, so the decode pad below would just be sliced back off.
+        skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
         if self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            padded_num_heads = (
+                self.n_local_heads
+                if skip_decode_pad
+                else (64 if self.n_local_heads <= 64 else self.n_heads)
+            )
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
@@ -1398,8 +1421,9 @@ class MQALayer(MqaAttentionBase):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
+                # sm100 (Blackwell) and sm12x: ue8m0 scales via the dedicated
+                # JIT kernel.
                 o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                 recipe = (1, 1, 128)
             else:
@@ -1637,7 +1661,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, False
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        # The deepgemm tf32 gemm wins at large M (prefill) but its fixed
+        # dispatch cost dominates at small M (decode): dispatch by token count.
+        if (
+            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and x.shape[0] >= _HC_PRENORM_DEEPGEMM_MIN_TOKENS
+        ):
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
                 tf32_hc_prenorm_gemm,
             )
@@ -1664,6 +1693,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
+
         # y is the post-norm activation fed into the MoE. Allocate it in the
         # symmetric memory pool so the downstream all-reduce uses the low-latency
         # NCCL symmetric path: the Triton inplace MoE runner writes the expert
@@ -1673,7 +1704,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1).to(dtype)
+            y = hc_combine(x_flat, pre.squeeze(1).contiguous(), self.hc_mult, dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
@@ -2736,7 +2767,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from sglang.srt.layers import deep_gemm_wrapper
 
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
             from deep_gemm import transform_sf_into_required_layout
 
         if is_nextn:
@@ -2753,7 +2784,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             D = attn.wo_a.weight.shape[1]
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
                 attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
                     raw_scale,
                     mn=R,
