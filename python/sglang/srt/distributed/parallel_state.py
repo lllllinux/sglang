@@ -467,6 +467,26 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+
+        self.pcie_ipc_comm: Optional[Any] = None
+        # Only the tensor-parallel group issues the per-layer reductions these
+        # kernels target; other groups would just pin IPC buffers.
+        if (
+            envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.get()
+            and self.world_size > 1
+            and "tp" in self.unique_name
+        ):
+            try:
+                from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
+                    PcieIpcCommunicator,
+                )
+
+                # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
+                self.pcie_ipc_comm = PcieIpcCommunicator(
+                    group=self.device_group, device=self.device
+                )
+            except Exception as e:
+                logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -920,6 +940,16 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
+        # After ``ca``: the PCIe-IPC kernels are for hosts where no fabric-specific
+        # backend applies. They do not probe for NVLink, so on a host that has it
+        # this ordering is what keeps the faster backend in front of them.
+        if (
+            self.pcie_ipc_comm is not None
+            and not self.pcie_ipc_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
+        ):
+            return "pcie_ipc"
         if (
             self.qr_comm is not None
             and not self.qr_comm.disabled
@@ -1001,6 +1031,8 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "pcie_ipc":
+            return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)
@@ -1463,6 +1495,24 @@ class GroupCoordinator:
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
         )
+        return input_
+
+    def broadcast_capture_safe(self, input_: torch.Tensor, src: int = 0):
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+
+        if self.world_size == 1:
+            return input_
+        if input_.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
+            return self.broadcast(input_, src=src)
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or not pynccl_comm.available:
+            raise RuntimeError(
+                f"CUDA graph broadcast on group {self.unique_name!r} requires "
+                "an available PyNCCL communicator."
+            )
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.broadcast(input_, src=src)
         return input_
 
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
@@ -2340,6 +2390,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    use_attn_tp_pynccl: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2362,6 +2413,9 @@ def initialize_model_parallel(
             tensor-parallel group during decoding. Must be a divisor of
             tensor_model_parallel_size and is currently only supported on the
             AMD HIP platform.
+        use_attn_tp_pynccl: create a PyNCCL communicator for a split
+            attention tensor-parallel group. This is required by collectives
+            captured in CUDA graphs on that group.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2572,7 +2626,9 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
+            use_pynccl=(
+                SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem or use_attn_tp_pynccl
+            ),
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),

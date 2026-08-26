@@ -41,6 +41,25 @@ class _RotaryEmbeddingStub(_ModuleStub):
 
 
 class TestDeepseekV4RoPEPolicy(CustomTestCase):
+    def test_sm120_wo_a_scale_policy_has_architecture_guard(self):
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        deepseek_v4._wo_a_ue8m0_sm12x.cache_clear()
+        try:
+            with (
+                patch.object(deepseek_v4, "_FP8_WO_A_GEMM", True),
+                patch.object(
+                    deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False
+                ),
+                patch.object(deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
+                patch.object(
+                    deepseek_v4, "is_sm120_supported", return_value=True
+                ),
+            ):
+                self.assertTrue(deepseek_v4._wo_a_ue8m0_sm12x())
+        finally:
+            deepseek_v4._wo_a_ue8m0_sm12x.cache_clear()
+
     @staticmethod
     def _config(compress_ratio):
         return SimpleNamespace(

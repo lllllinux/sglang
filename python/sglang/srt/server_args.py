@@ -3442,9 +3442,21 @@ class ServerArgs:
             "Useful when each admission is disproportionately expensive, e.g. "
             "speculative decoding with a separate draft prefill pass. An "
             "explicit value always wins, capped by max-running-requests "
-            "(1 disables). When unset, DFlash workloads auto-enable the "
-            "formula; other workloads stay disabled. Not supported with "
-            "pipeline parallelism."
+            "(1 disables). When unset, DFlash workloads scale the formula "
+            "from active request demand; other workloads stay disabled. Not "
+            "supported with pipeline parallelism; bypassed when priority "
+            "preemption is enabled."
+        ),
+        NS("schedule"),
+    ] = None
+    min_free_slots_max_delay_passes: A[
+        Optional[int],
+        (
+            "Maximum scheduler passes to wait while accumulating the "
+            "requested free slots. Unset waits at most the observed running-"
+            "request target in scheduler passes; 0 disables waiting. Only "
+            "applies when the min-free-slots delay is explicitly or "
+            "automatically enabled."
         ),
         NS("schedule"),
     ] = None
@@ -3680,6 +3692,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._validate_min_free_slots_max_delay_passes()
 
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
@@ -5565,15 +5578,23 @@ class ServerArgs:
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                    envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
                     envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
-                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-                # Prefer TileLang over the Torch fallback.
-                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+                if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
+                    envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                # Out of the box the indexer runs the TileLang kernel (works on
+                # stock DeepGEMM); both knobs stay env-overridable so a DeepGEMM
+                # build with SM120 attention support can opt into
+                # fp8_paged_mqa_logits by setting them to 0.
+                if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.is_set():
+                    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
+                    envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
@@ -8204,7 +8225,7 @@ class ServerArgs:
             explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
             supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and is_sm90_supported()
+                and (is_sm90_supported() or is_sm120_supported())
                 and explicit
             )
             if not supported and explicit:
@@ -8629,6 +8650,13 @@ class ServerArgs:
     def _validate_prefill_decode_interval(self):
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative.")
+
+    def _validate_min_free_slots_max_delay_passes(self):
+        if (
+            self.min_free_slots_max_delay_passes is not None
+            and self.min_free_slots_max_delay_passes < 0
+        ):
+            raise ValueError("--min-free-slots-max-delay-passes must be non-negative.")
 
     def _handle_other_validations(self):
         if self.default_chat_template_kwargs is not None and not isinstance(

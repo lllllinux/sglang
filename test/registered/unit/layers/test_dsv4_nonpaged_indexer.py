@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -70,6 +69,15 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # These are CPU contract tests. The production helper queries CUDA
+        # free memory, so keep ordinary plan cases on its unbudgeted path and
+        # override the helper explicitly in the routing test below.
+        budget = patch(f"{_INDEXER}._mqa_logits_budget_bytes", return_value=None)
+        budget.start()
+        self.addCleanup(budget.stop)
+
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
@@ -139,7 +147,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
         )
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(
+            nonpaged_plan=None, c4_page_size=64, max_c4_seq_len=128
+        )
         page_table = torch.tensor([[3, 1]], dtype=torch.int32).repeat(query_rows, 1)
         c4_seq_lens = torch.tensor([62, 63, 64, 65], dtype=torch.int32)
 
@@ -187,7 +197,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
         )
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(
+            nonpaged_plan=None, c4_page_size=64, max_c4_seq_len=125_056
+        )
         page_table = torch.zeros((query_rows, 1), dtype=torch.int32)
         c4_seq_lens = torch.tensor(
             [124_997, 124_998, 124_999, 125_000], dtype=torch.int32
@@ -225,7 +237,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=can_use_nonpaged_indexer)
         backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
         c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=512)
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(
+            nonpaged_plan=None, c4_page_size=64, max_c4_seq_len=64
+        )
 
         def build_plan(query_rows):
             batch = SimpleNamespace(
@@ -265,6 +279,35 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
         with threshold.override(8193):
             self.assertIsNone(build_plan(8192))
+
+    def test_oversized_logits_decline_nonpaged_plan(self):
+        can_use_nonpaged_indexer = MagicMock(return_value=True)
+        backend = SimpleNamespace(_can_use_nonpaged_indexer=can_use_nonpaged_indexer)
+        backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=512)
+        query_rows = 8192
+        batch = SimpleNamespace()
+        metadata = SimpleNamespace(
+            nonpaged_plan=None, c4_page_size=64, max_c4_seq_len=4096
+        )
+
+        threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
+        with (
+            threshold.override(query_rows),
+            patch(f"{_INDEXER}._mqa_logits_budget_bytes", return_value=1),
+        ):
+            plan = C4IndexerBackendMixin._get_nonpaged_indexer_plan(
+                backend,
+                c4_indexer=c4_indexer,
+                forward_batch=batch,
+                indexer_metadata=metadata,
+                page_table=torch.zeros((query_rows, 1), dtype=torch.int32),
+                c4_seq_lens=torch.ones(query_rows, dtype=torch.int32),
+                query_rows=query_rows,
+            )
+
+        self.assertIsNone(plan)
+        can_use_nonpaged_indexer.assert_not_called()
 
     def test_nonpaged_dispatch_uses_gathered_kv_contract(self):
         query_rows = 4

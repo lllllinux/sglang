@@ -159,3 +159,43 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("decode_paths")
+async def decode_paths(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Warm text, greedy, and sampled multi-token paths before HTTP readiness.
+
+    A one-token prefill warmup does not enter every speculative sampling,
+    acceptance, and request-pool bookkeeping path.  An input-ID-only warmup also
+    misses metadata specializations reached by the normal text-serving path.
+    Drain one deterministic text request and one sampled input-ID request far
+    enough to cross multiple DSPARK proposal blocks.
+    """
+    rng = np.random.default_rng(0)
+    requests = (
+        GenerateReqInput(
+            text="The capital city of France is",
+            sampling_params={
+                "max_new_tokens": 16,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "ignore_eos": True,
+            },
+        ),
+        GenerateReqInput(
+            input_ids=rng.integers(2**16, size=256).tolist(),
+            sampling_params={
+                "max_new_tokens": 16,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "ignore_eos": True,
+            },
+        ),
+    )
+    for generate_req_input in requests:
+        if disaggregation_mode != "null":
+            generate_req_input.bootstrap_room = 0
+            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+        async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+            pass

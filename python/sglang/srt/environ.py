@@ -1117,6 +1117,22 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # FlashInfer PCIe-IPC all-reduce, for switch-free intra-node hosts (no
+    # NVLink, no multicast) where the backends above do not apply. Which shapes
+    # the kernels take is FlashInfer's own decision, not a size knob here: an
+    # unsupported shape is reported as such and the caller keeps its NCCL path.
+    SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Resolve and persist machine-specific PCIe-IPC launch configurations at
+    # startup. FlashInfer reuses exact cached shapes without profiling them.
+    # Disabled by default because cache misses add one-time startup work and
+    # should be measured on an otherwise idle host.
+    SGLANG_PCIE_IPC_AUTOTUNE = EnvBool(False)
+    # Elements its workspace is sized for. It cannot grow after construction, so
+    # 0 sizes it for the widest decode (cuda_graph_config[decode].max_bs *
+    # hidden), leaving prefill chunks on NCCL -- measured faster than routing
+    # them here. Raise it to hand larger reductions to the kernels, at
+    # ~2 * world_size * max_numel * itemsize bytes per rank.
+    SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
     # RoPE cache
@@ -1283,6 +1299,10 @@ class Envs:
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+    # Fraction of currently-free device memory the transient DSV4 indexer
+    # logits tensor ([query_rows, max_c4_seq_len] fp32, unaccounted by
+    # mem_fraction_static) may occupy before query rows are sliced.
+    SGLANG_DSV4_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
