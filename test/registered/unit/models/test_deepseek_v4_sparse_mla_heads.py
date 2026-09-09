@@ -36,7 +36,7 @@ class TestDeepseekV4SparseMlaHeads(CustomTestCase):
             patch.object(deepseek_v4, "is_sm120_supported", return_value=True),
             envs.SGLANG_SM120_FLASHMLA_BACKEND.override("flashinfer"),
             patch.object(
-                flash_mla_sm120,
+                deepseek_v4,
                 "flashinfer_dsv4_decode_supports_num_heads",
                 return_value=True,
             ),
@@ -66,7 +66,7 @@ class TestDeepseekV4SparseMlaHeads(CustomTestCase):
             with (
                 envs.SGLANG_SM120_FLASHMLA_BACKEND.override("flashinfer"),
                 patch.object(
-                    flash_mla_sm120,
+                    deepseek_v4,
                     "flashinfer_dsv4_decode_supports_num_heads",
                     return_value=False,
                 ),
