@@ -13,7 +13,8 @@ separate region at the end of each page.
 
 import logging
 import math
-from typing import Optional
+from functools import lru_cache
+from typing import FrozenSet, Optional, Tuple
 
 import torch
 import triton
@@ -211,6 +212,26 @@ _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
 
 
 SM120_DECODE_MAX_TOKENS = 64
+
+
+@lru_cache(maxsize=1)
+def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _DECODE_DSV4_DISPATCH,
+            _DECODE_MAX_TOKENS,
+        )
+    except (AttributeError, ImportError):
+        return 0, frozenset()
+
+    return int(_DECODE_MAX_TOKENS), frozenset(
+        num_heads for num_heads, _ in _DECODE_DSV4_DISPATCH
+    )
+
+
+def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
+    decode_max_tokens, supported_heads = _flashinfer_dsv4_decode_capabilities()
+    return num_tokens <= decode_max_tokens and num_heads in supported_heads
 
 
 def _flash_mla_sm120_prefill(
