@@ -87,11 +87,8 @@ class TestSpecPrepareSwaEviction(CustomTestCase):
 
         batch, req = _make_batch(spec_is_dflash_family=False, spec_is_uno=True)
         batch.spec_info = MagicMock(spec=UnoDraftInput)
-        with patch.object(
-            UnoDraftInput, "prepare_for_decode"
-        ) as uno_prep:
-            self._run(batch)
-        uno_prep.assert_called_once_with(batch)
+        self._run(batch)
+        batch.spec_info.prepare_for_decode.assert_called_once_with(batch)
         self.assertEqual(req.decode_batch_idx, 0)
         batch.maybe_evict_swa.assert_not_called()
 
