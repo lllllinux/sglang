@@ -20,9 +20,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def _make_batch(spec_is_dflash_family: bool):
+def _make_batch(spec_is_dflash_family: bool, spec_is_uno: bool = False):
     batch = MagicMock()
     batch.spec_algorithm.is_dflash_family.return_value = spec_is_dflash_family
+    batch.spec_algorithm.is_uno.return_value = spec_is_uno
     req = SimpleNamespace(decode_batch_idx=0)
     batch.reqs = [req]
     return batch, req
@@ -67,7 +68,11 @@ class TestSpecPrepareSwaEviction(CustomTestCase):
         self.assertEqual(req.decode_batch_idx, 1)
 
     def test_eagle_path_unchanged(self):
-        batch, req = _make_batch(spec_is_dflash_family=False)
+        # Since #37667 the dispatcher routes uno through its own draft-input
+        # prep; a non-dflash, non-uno algorithm must still hit the eagle
+        # helper. Pin is_uno=False explicitly -- a bare MagicMock would
+        # truthy-match the uno branch and never reach the eagle path.
+        batch, req = _make_batch(spec_is_dflash_family=False, spec_is_uno=False)
         with patch(
             "sglang.srt.speculative.eagle_utils.eagle_prepare_for_decode"
         ) as eagle_prep:
@@ -76,6 +81,19 @@ class TestSpecPrepareSwaEviction(CustomTestCase):
         # The dflash-branch tick must not run on the eagle path.
         self.assertEqual(req.decode_batch_idx, 0)
         batch.spec_info.prepare_for_decode.assert_not_called()
+
+    def test_uno_path_routes_to_uno_draft_input(self):
+        from sglang.srt.speculative.uno_info import UnoDraftInput
+
+        batch, req = _make_batch(spec_is_dflash_family=False, spec_is_uno=True)
+        batch.spec_info = MagicMock(spec=UnoDraftInput)
+        with patch.object(
+            UnoDraftInput, "prepare_for_decode"
+        ) as uno_prep:
+            self._run(batch)
+        uno_prep.assert_called_once_with(batch)
+        self.assertEqual(req.decode_batch_idx, 0)
+        batch.maybe_evict_swa.assert_not_called()
 
 
 if __name__ == "__main__":
