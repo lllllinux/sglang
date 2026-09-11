@@ -40,13 +40,16 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
-from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+_is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
@@ -84,7 +87,7 @@ class TargetVerifyExecutor:
         verify_num_draft_tokens: int,
         model_runner,
         kv_injector: TargetHiddenKvInjector,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
     ) -> None:
@@ -138,9 +141,14 @@ class TargetVerifyExecutor:
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
 
-        self._tp_sync.sync(correct_len)
-        self._tp_sync.sync(bonus)
-        self._tp_sync.sync(cap_trim_lens)
+        site = (
+            SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
+            if sampling_info is None or sampling_info.is_all_greedy
+            else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
+        )
+        self._tp_sync.sync(site, correct_len)
+        self._tp_sync.sync(site, bonus)
+        self._tp_sync.sync(site, cap_trim_lens)
 
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,
@@ -221,6 +229,7 @@ class TargetVerifyExecutor:
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
+        verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -228,7 +237,7 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
 
     def run_non_compact(
@@ -250,6 +259,7 @@ class TargetVerifyExecutor:
             draft_token_num=verify_w,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -258,9 +268,9 @@ class TargetVerifyExecutor:
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-                batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         result = self._forward_prepared_verify(
             batch=batch,
@@ -296,7 +306,7 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
@@ -362,6 +372,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=layout,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -464,7 +475,6 @@ class TargetVerifyExecutor:
 
 
 class CommitInjectCtx(msgspec.Struct):
-
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
@@ -481,14 +491,13 @@ class AcceptOuts(msgspec.Struct):
 
 
 class DsparkVerifyEpilogue:
-
     def __init__(
         self,
         *,
         max_bs: int,
         verify_num_draft_tokens: int,
         device,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
     ) -> None:
         self.max_bs = int(max_bs)
@@ -640,9 +649,9 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=verify_lens,
         )
-        self._tp_sync.sync(correct_len)
-        self._tp_sync.sync(bonus)
-        self._tp_sync.sync(cap_trim_lens)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,

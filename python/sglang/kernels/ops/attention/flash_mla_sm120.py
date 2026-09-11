@@ -77,9 +77,7 @@ def _gather_and_dequant(k_cache, indices, page_size):
     raw_pages = k_cache.as_strided(
         (num_pages, page_bytes),
         (page_bytes, 1),
-    ).view(
-        torch.uint8
-    )  # (num_pages, page_bytes) uint8
+    ).view(torch.uint8)  # (num_pages, page_bytes) uint8
     # Note: float8_e4m3fn and uint8 are both 1 byte, view is safe
 
     # Compute byte offsets within each page
@@ -439,13 +437,12 @@ def _page_mark_kernel(
     the same value 1 are safe (no atomic needed).
     """
     pid = tl.program_id(0)
-    if pid >= N_idx:
-        return
-    idx = tl.load(indices_ptr + pid)
-    if idx < 0:
-        return
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < N_idx
+    idx = tl.load(indices_ptr + offs, mask=valid, other=-1)
+    keep = valid & (idx >= 0)
     page = idx // SRC_PBS
-    tl.store(mask_ptr + page, 1)
+    tl.store(mask_ptr + page, tl.full((BLOCK,), 1, tl.int8), mask=keep)
 
 
 def _split_kv_pages_to_64(
@@ -519,12 +516,13 @@ def _split_kv_pages_to_64(
         idx_flat = touched_indices.reshape(-1).contiguous()
         if idx_flat.dtype != torch.int32:
             idx_flat = idx_flat.to(torch.int32)
-        _page_mark_kernel[(idx_flat.numel(),)](
+        _MARK_BLOCK = 1024
+        _page_mark_kernel[(triton.cdiv(idx_flat.numel(), _MARK_BLOCK),)](
             idx_flat,
             mask,
             idx_flat.numel(),
             src_pbs,  # SRC_PBS
-            1024,  # BLOCK (unused, kept for JIT signature)
+            _MARK_BLOCK,
         )
         mask_ptr = mask
 
