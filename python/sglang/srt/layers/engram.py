@@ -528,6 +528,63 @@ def _drop_page_cache_once(reason: str) -> None:
     )
 
 
+def _memfd_create(name: str) -> int:
+    """os.memfd_create, falling back to the memfd_create(2) syscall.
+
+    Anaconda's python builds compile against glibc headers old enough that
+    os.memfd_create is not exposed even on a kernel that has the syscall.
+    """
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create(name, 0)
+    # MFD_CLOEXEC = 1 (memfd_create flags); syscall number differs per arch --
+    # pull it from glibc when available, else use the x86_64/aarch64 numbers.
+    syscall_nr = {
+        "x86_64": 319,
+        "aarch64": 279,
+    }.get(os.uname().machine)
+    if syscall_nr is None:
+        try:
+            syscall_nr = ctypes.CDLL(None).syscall_memfd_create  # never exists
+        except AttributeError:
+            raise RuntimeError(
+                "engram host table: os.memfd_create is unavailable and the "
+                f"{os.uname().machine} syscall number is unknown"
+            )
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    fd = libc.syscall(
+        ctypes.c_long(syscall_nr), ctypes.c_char_p(name.encode()), ctypes.c_uint(1)
+    )
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "memfd_create(2) failed")
+    return int(fd)
+
+
+def _unpinned_host_access() -> Optional[bool]:
+    """cudaDevAttrPageableMemoryAccess: can the GPU dereference unpinned
+    host pointers (Grace's ATS / HMM)?
+
+    The attribute is 0 on every discrete Blackwell board probed so far, and a
+    gather from a plain mmap indeed takes down the context with an illegal
+    memory access. Pinned host memory works everywhere; the unpinned mode is
+    kept for ATS platforms where this returns True.
+    """
+    try:
+        cudart = ctypes.CDLL("libcudart.so")
+    except OSError:
+        return None
+    val = ctypes.c_int(0)
+    CUDART_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS = 135
+    rc = cudart.cudaDeviceGetAttribute(
+        ctypes.byref(val),
+        CUDART_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
+        ctypes.c_int(torch.cuda.current_device()),
+    )
+    if rc != 0:
+        return None
+    return bool(val.value)
+
+
 class _HostTable:
     """Host-memory backing for one engram table.
 
@@ -547,6 +604,15 @@ class _HostTable:
         self.group = group
         self.dirty = False
         self.registered = False
+        if not pin and _unpinned_host_access() is False:
+            # A discrete GPU cannot dereference the plain mapping: the gather
+            # would fault the CUDA context. Pinning costs one page-table walk
+            # per row at startup and makes every lookup safe.
+            pin = True
+            logger.warning(
+                "engram host table: the GPU cannot reach unpinned host memory "
+                "(no ATS); pinning the table with cudaHostRegister"
+            )
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -595,7 +661,7 @@ class _HostTable:
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
         if self.group.rank_in_group == 0:
-            fd = os.memfd_create(name, 0)
+            fd = _memfd_create(name)
             os.ftruncate(fd, nbytes)
             owner = (os.getpid(), fd)
         pid, owner_fd = self.group.broadcast_object(owner, src=0)
@@ -651,7 +717,7 @@ class _HostTable:
         msg = (
             f"engram host table {label}: layout={self.layout}, "
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
-            f"({pct:.0f}%){', pinned' if self.registered else ', unpinned (ATS)'}"
+            f"({pct:.0f}%){', pinned' if self.registered else ', unpinned'}"
         )
         if huge_kb == 0:
             knob = "shmem_enabled" if self.layout == "shared" else "enabled"

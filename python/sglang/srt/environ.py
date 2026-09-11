@@ -1428,7 +1428,9 @@ class Envs:
     # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
     SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
     # Pin and map the host table with cudaHostRegister. False leaves the plain
-    # mapping to the platform (Grace-Blackwell ATS reaches it directly).
+    # mapping to the platform, which needs GPU-addressable host memory
+    # (Grace-Blackwell ATS / HMM); where the device cannot reach unpinned host
+    # memory the table is pinned regardless of this flag.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
     # How the host table is laid out: "shared" is one memfd copy for the TP group
     # with no all-reduce; "private" is one anonymous mapping per rank holding its
