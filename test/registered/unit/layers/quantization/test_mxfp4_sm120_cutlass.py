@@ -98,16 +98,36 @@ def test_dsv4_sm120_load_contract(monkeypatch, request):
 
     with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
         method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
-    method.create_weights(
-        SimpleNamespace(),
-        num_experts=4,
-        hidden_size=256,
-        intermediate_size_per_partition=256,
-        params_dtype=torch.bfloat16,
-    )
 
-    assert method.load_up_proj_weight_first
-    assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
+        # V4.1 Flash TP4 gives intermediate 2304/4 = 576: SM120 records the
+        # 640 padding instead of failing construction; buffers stay
+        # checkpoint-shaped so the loader's naive copy remains correct.
+        method.create_weights(
+            SimpleNamespace(),
+            num_experts=4,
+            hidden_size=256,
+            intermediate_size_per_partition=576,
+            params_dtype=torch.bfloat16,
+        )
+        assert method._padded_intermediate == 640
+        assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
+
+        # SM90 keeps the hard requirement (its interleave is in-place). The
+        # constructor snapshots _use_mxfp8_act_scaling, so build it inside
+        # the sm90 override; get_platform() consults the override map, not
+        # the lru_cache'd hardware probe.
+        with override_platform(is_sm120=False, is_sm90=True):
+            method_sm90 = adapter_module.Mxfp4FlashinferCutlassMoEMethod(
+                _Fp8Method(), "t90"
+            )
+            with pytest.raises(ValueError):
+                method_sm90.create_weights(
+                    SimpleNamespace(),
+                    num_experts=4,
+                    hidden_size=256,
+                    intermediate_size_per_partition=576,
+                    params_dtype=torch.bfloat16,
+                )
 
 
 def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
@@ -251,6 +271,193 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
         output=expected,
     )
 
+    assert torch.equal(actual, expected)
+
+
+def test_dsv4_sm120_intermediate_padding_layout_and_parity(monkeypatch):
+    """V4.1 Flash TP4/TP8 shards (intermediate 576/288) must survive loading.
+
+    create_weights keeps the checkpoint shape so the FusedMoE loader's naive
+    copy stays correct; process_weights_after_loading then rebuilds the
+    experts at a 128-aligned intermediate (576 -> 640 here) and the CUTLASS
+    kernel must accept the padded buffers.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 required")
+    pytest.importorskip("flashinfer.fused_moe")
+
+    from flashinfer import block_scale_interleave, mxfp8_quantize
+    from flashinfer.fused_moe import cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
+
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
+    from sglang.srt.runtime_context import get_context
+
+    monkeypatch.setattr(
+        runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
+    )
+    monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
+
+    # TP4 of intermediate 2304: 576 per rank, padded to 640 for CUTLASS.
+    num_experts, hidden, intermediate = 4, 256, 96
+    padded_intermediate = 128
+    w13, w2, w13_scale, w2_scale = _random_weights(num_experts, hidden, intermediate)
+    w1, w3 = w13.chunk(2, dim=1)
+    w1_scale, w3_scale = w13_scale.chunk(2, dim=1)
+    # Simulate FusedMoE's ``load_up_proj_weight_first`` loader contract.
+    w31 = torch.cat((w3, w1), dim=1)
+    w31_scale = torch.cat(
+        (w3_scale.view(torch.uint8), w1_scale.view(torch.uint8)),
+        dim=1,
+    ).view(torch.float8_e8m0fnu)
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(w31.clone(), requires_grad=False),
+        w2_weight=torch.nn.Parameter(w2.clone(), requires_grad=False),
+        w13_weight_scale_inv=torch.nn.Parameter(w31_scale.clone(), requires_grad=False),
+        w2_weight_scale_inv=torch.nn.Parameter(w2_scale.clone(), requires_grad=False),
+        num_local_experts=num_experts,
+        intermediate_size_per_partition=intermediate,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        moe_ep_size=1,
+        moe_ep_rank=0,
+    )
+
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+        method = Mxfp4FlashinferCutlassMoEMethod(
+            SimpleNamespace(process_weights_after_loading=lambda layer: None),
+            "test",
+        )
+        # create_weights on the real path delegates to Fp8MoEMethod, which
+        # already allocated the checkpoint-shaped buffers on ``layer``; here
+        # only the alignment bookkeeping matters.
+        method._padded_intermediate = padded_intermediate
+        config = MoeRunnerConfig(
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            hidden_size=hidden,
+            intermediate_size_per_partition=intermediate,
+            top_k=2,
+            activation="silu",
+            is_gated=True,
+            swiglu_limit=10,
+        )
+        method.create_moe_runner(layer, config)
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.intermediate_size_per_partition == padded_intermediate
+    assert layer.w13_weight.shape == (num_experts, 2 * padded_intermediate, hidden // 2)
+    assert layer.w2_weight.shape == (num_experts, hidden, padded_intermediate // 2)
+    assert layer.w13_weight_scale_inv.shape == (
+        num_experts,
+        2 * padded_intermediate,
+        hidden // 32,
+    )
+    assert layer.w2_weight_scale_inv.shape == (
+        num_experts,
+        hidden,
+        padded_intermediate // 32,
+    )
+    # up rows sit first, gate rows behind the 128-aligned boundary, padding
+    # rows stay zero (weights AND scales).
+    assert torch.equal(layer.w13_weight[:num_experts, :intermediate], w3)
+    assert torch.equal(
+        layer.w13_weight[
+            :num_experts, padded_intermediate : padded_intermediate + intermediate
+        ],
+        w1,
+    )
+    assert torch.equal(
+        layer.w13_weight[:num_experts, intermediate:padded_intermediate],
+        torch.zeros_like(layer.w13_weight[:num_experts, intermediate:padded_intermediate]),
+    )
+    assert torch.equal(layer.w2_weight[:, :, : intermediate // 2], w2)
+    assert torch.equal(
+        layer.w2_weight[:, :, intermediate // 2 :],
+        torch.zeros_like(layer.w2_weight[:, :, intermediate // 2 :]),
+    )
+
+    expected_w13_scale = block_scale_interleave(
+        torch.cat(
+            (
+                w31_scale.view(torch.uint8)[:, :intermediate],
+                torch.zeros(
+                    num_experts,
+                    padded_intermediate - intermediate,
+                    hidden // 32,
+                    dtype=torch.uint8,
+                    device="cuda",
+                ),
+                w31_scale.view(torch.uint8)[:, intermediate:],
+                torch.zeros(
+                    num_experts,
+                    padded_intermediate - intermediate,
+                    hidden // 32,
+                    dtype=torch.uint8,
+                    device="cuda",
+                ),
+            ),
+            dim=1,
+        )
+    ).reshape(num_experts, 2 * padded_intermediate, hidden // 32)
+    assert torch.equal(
+        layer.w13_weight_scale_inv.view(torch.uint8), expected_w13_scale
+    )
+
+    # End-to-end: the adapter's padded buffers must be accepted by the kernel
+    # and match a direct call using the very same buffers.
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda", generator=generator)
+    logits = torch.randn(
+        8, num_experts, dtype=torch.float32, device="cuda", generator=generator
+    )
+    topk_weights, topk_ids = torch.topk(torch.softmax(logits, dim=-1), 2, dim=-1)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    topk = StandardTopKOutput(topk_weights, topk_ids.to(torch.int32), logits)
+    dispatch_output = StandardDispatchOutput(x, None, topk)
+
+    actual = method.apply(layer, dispatch_output).hidden_states
+
+    x_quant, x_scale = mxfp8_quantize(
+        x,
+        is_sf_swizzled_layout=True,
+        alignment=32,
+    )
+    global_scale = torch.ones(num_experts, dtype=torch.float32, device="cuda")
+    swiglu_limit = torch.full((num_experts,), 10.0, dtype=torch.float32, device="cuda")
+    expected = torch.empty_like(x)
+    cutlass_fused_moe(
+        input=x_quant,
+        token_selected_experts=topk_ids.to(torch.int32),
+        token_final_scales=topk_weights,
+        fc1_expert_weights=layer.w13_weight.view(torch.int64),
+        fc2_expert_weights=layer.w2_weight.view(torch.int64),
+        output_dtype=torch.bfloat16,
+        quant_scales=[
+            layer.w13_weight_scale_inv.view(torch.int32),
+            global_scale,
+            layer.w2_weight_scale_inv.view(torch.int32),
+            global_scale,
+        ],
+        input_sf=x_scale,
+        swiglu_alpha=torch.ones(num_experts, dtype=torch.float32, device="cuda"),
+        swiglu_beta=torch.zeros(num_experts, dtype=torch.float32, device="cuda"),
+        swiglu_limit=swiglu_limit,
+        use_mxfp8_act_scaling=True,
+        activation_type=ActivationType.Swiglu,
+        tune_max_num_tokens=8,
+        output=expected,
+    )
     assert torch.equal(actual, expected)
 
 

@@ -15,7 +15,7 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.srt.runtime_context import get_exec, get_platform
-from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
+from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0, round_up
 
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
@@ -48,6 +48,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
         self._swiglu_limit_tensor: torch.Tensor | None = None
         self._use_swiglu_step = False
         self._mxfp4_weight_global_scale_tensor: torch.Tensor | None = None
+        # Set by create_weights when the SM120 CUTLASS path must pad the
+        # intermediate up to the 128 alignment the kernel requires.
+        self._padded_intermediate: int | None = None
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -63,14 +66,25 @@ class Mxfp4FlashinferCutlassMoEMethod:
         params_dtype,
         **extra_weight_attrs,
     ):
-        # Both CUTLASS paths require dimensions aligned to 128.
-        if hidden_size % 128 != 0 or intermediate_size_per_partition % 128 != 0:
+        # Both CUTLASS paths require dimensions aligned to 128 at kernel time.
+        # hidden_size is already 128-aligned for every DSv4 variant. The
+        # intermediate is not (V4.1 Flash TP4/TP8 give 576/288), but padding the
+        # buffer here would move the gate/up split the loader writes into
+        # (FusedMoE.weight_loader copies the checkpoint shard naively), so the
+        # buffers keep the checkpoint shape and the SM120 post-load processor
+        # below rebuilds a 128-padded [up; gate] layout once loading finished.
+        # SM90 interleaves in place and keeps its original hard requirement.
+        if hidden_size % 128 != 0 or (
+            not self._use_mxfp8_act_scaling and intermediate_size_per_partition % 128 != 0
+        ):
             raise ValueError(
                 "Mxfp4FlashinferCutlassMoEMethod requires hidden_size and "
                 "intermediate_size_per_partition to be multiples of 128 "
                 f"(got hidden={hidden_size}, "
                 f"intermediate={intermediate_size_per_partition})."
             )
+        if self._use_mxfp8_act_scaling:
+            self._padded_intermediate = round_up(intermediate_size_per_partition, 128)
         # Keep checkpoint scales in native E8M0 instead of staging them as FP32.
         self._fp8.create_weights(
             layer,
@@ -121,8 +135,67 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
 
+    def _pad_intermediate_for_sm120(self, layer: Module) -> None:
+        """Rebuild the experts at a 128-aligned intermediate on SM120.
+
+        DSv4 checkpoints shard each expert's ``[2*intermediate, hidden]`` w13
+        and ``[hidden, intermediate]`` w2 along the intermediate (TP4/TP8 of
+        V4.1 Flash give 576/288), which the CUTLASS kernel cannot consume
+        (E8M0 scale tiles need N % 128 == 0). The load used the checkpoint
+        shape, so this runs after loading: splits the loaded ``[up; gate]``
+        w13 halves, zero-pads each half independently to
+        ``_padded_intermediate``, and pads w2 and both E8M0 scale tensors
+        along the same axis. Zero rows produce zero activations, so the
+        padded experts compute exactly what the unpadded ones would. Scale
+        swizzling is left to the shared SM120 branch below, which sees the
+        final padded shapes.
+        """
+        E = layer.num_local_experts
+        N = layer.intermediate_size_per_partition
+        N_pad = self._padded_intermediate
+        K = layer.w13_weight.shape[2] * 2
+        device = layer.w13_weight.device
+
+        def pad_up_gate(weight: torch.Tensor, cols: int) -> torch.Tensor:
+            out = torch.zeros(E, 2 * N_pad, cols, dtype=weight.dtype, device=device)
+            out[:, :N, :] = weight[:, :N, :]  # up half
+            out[:, N_pad : N_pad + N, :] = weight[:, N:, :]  # gate half
+            return out
+
+        def pad_w2(weight: torch.Tensor, cols: int) -> torch.Tensor:
+            out = torch.zeros(E, K, cols, dtype=weight.dtype, device=device)
+            out[:, : weight.shape[1], : weight.shape[2]] = weight
+            return out
+
+        layer.w13_weight = Parameter(
+            pad_up_gate(layer.w13_weight.data, K // 2), requires_grad=False
+        )
+        layer.w13_weight_scale_inv = Parameter(
+            pad_up_gate(layer.w13_weight_scale_inv.data, K // _GROUP_SIZE),
+            requires_grad=False,
+        )
+        layer.w2_weight = Parameter(
+            pad_w2(layer.w2_weight.data, N_pad // 2), requires_grad=False
+        )
+        layer.w2_weight_scale_inv = Parameter(
+            pad_w2(layer.w2_weight_scale_inv.data, N_pad // _GROUP_SIZE),
+            requires_grad=False,
+        )
+        layer.intermediate_size_per_partition = N_pad
+        torch.cuda.empty_cache()
+
     def process_weights_after_loading(self, layer: Module) -> None:
-        # Preserve the base FP4 post-load handling.
+        # Preserve the base FP4 post-load handling. With a non-128-aligned
+        # intermediate the base only validates E8M0 dtypes; padding must run
+        # first so the block_scale_interleave below sees the final shapes.
+        if (
+            self._use_mxfp8_act_scaling
+            and self._padded_intermediate is not None
+            and self._padded_intermediate
+            != getattr(layer, "intermediate_size_per_partition", None)
+        ):
+            self._pad_intermediate_for_sm120(layer)
+
         self._fp8.process_weights_after_loading(layer)
 
         if getattr(layer, "_mega_moe_weights_built", False):
