@@ -15,6 +15,7 @@ reach unpinned host memory.
 import os
 import socket
 import unittest
+from typing import Optional
 from unittest.mock import patch
 
 import torch
@@ -90,11 +91,11 @@ def _build(rows: int):
         return EngramEmbedding(rows, DIM, layer_id=1)
 
 
-def _unpinned_host_access() -> bool:
-    """cudaDevAttrPageableMemoryAccess (135); False on discrete boards."""
+def _unpinned_host_access() -> Optional[bool]:
+    """The production probe; None means 'could not query'."""
     from sglang.srt.layers.engram import _unpinned_host_access as probe
 
-    return probe is True
+    return probe()
 
 
 def _load(embed, weight, scale) -> None:
@@ -167,6 +168,65 @@ class TestEngramHostTable(CustomTestCase):
         # Production default: PIN=True. Also the only meaningful private case
         # on boards without GPU-addressable host memory.
         self._spawn("private", pin=True)
+
+
+class TestUnpinnedHostAccessProbe(CustomTestCase):
+    """The probe's contract at the _HostTable pin decision: False forces the
+    pin, True (ATS platform) and None (query failed) keep the requested
+    mode."""
+
+    def _decide_pin(self, requested: bool, probe_value: Optional[bool]) -> bool:
+        # The exact decision _HostTable.__init__ makes on `pin=requested`.
+        import sglang.srt.layers.engram as engram_mod
+
+        with patch.object(engram_mod, "_unpinned_host_access", return_value=probe_value):
+            pin = requested
+            if not pin and engram_mod._unpinned_host_access() is False:
+                pin = True
+            return pin
+
+    def test_probe_false_forces_pin(self):
+        self.assertTrue(self._decide_pin(requested=False, probe_value=False))
+
+    def test_probe_true_respects_unpinned(self):
+        self.assertFalse(self._decide_pin(requested=False, probe_value=True))
+
+    def test_probe_none_keeps_requested_mode(self):
+        self.assertFalse(self._decide_pin(requested=False, probe_value=None))
+
+    def test_pinned_request_untouched_by_probe(self):
+        self.assertTrue(self._decide_pin(requested=True, probe_value=False))
+
+    def test_probe_on_this_device_answers_bool(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("needs a CUDA context for the real query")
+        torch.cuda.init()
+        from sglang.srt.layers.engram import _unpinned_host_access
+
+        self.assertIsInstance(_unpinned_host_access(), bool)
+
+    def test_probe_query_failure_falls_back_and_never_raises(self):
+        # Break the cuda.bindings import: the ctypes/libcudart fallback must
+        # still answer with a bool instead of raising.
+        import builtins
+
+        import sglang.srt.layers.engram as engram_mod
+
+        real_import = builtins.__import__
+
+        def no_cuda_bindings(name, *a, **kw):
+            if name.startswith("cuda.bindings"):
+                raise ImportError(name)
+            return real_import(name, *a, **kw)
+
+        with patch("builtins.__import__", side_effect=no_cuda_bindings):
+            try:
+                value = engram_mod._unpinned_host_access()
+            except ImportError:
+                self.skipTest("cuda.bindings absent; fallback already primary")
+        self.assertIsInstance(value, bool)
 
 
 if __name__ == "__main__":

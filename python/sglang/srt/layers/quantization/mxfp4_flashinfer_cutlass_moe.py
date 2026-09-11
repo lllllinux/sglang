@@ -182,7 +182,10 @@ class Mxfp4FlashinferCutlassMoEMethod:
             requires_grad=False,
         )
         layer.intermediate_size_per_partition = N_pad
-        torch.cuda.empty_cache()
+        # The displaced checkpoint-sized buffers become garbage here; the
+        # caching allocator reuses those segments for the next layer's
+        # temporaries, so an empty_cache() per layer would only force a
+        # device-wide synchronize per MoE layer during load.
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Preserve the base FP4 post-load handling. With a non-128-aligned

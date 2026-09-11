@@ -568,20 +568,60 @@ def _unpinned_host_access() -> Optional[bool]:
     gather from a plain mmap indeed takes down the context with an illegal
     memory access. Pinned host memory works everywhere; the unpinned mode is
     kept for ATS platforms where this returns True.
+
+    Returns False when the attribute cannot be queried (no bindings, no
+    libcudart, query error) -- pinning is the safe assumption everywhere
+    except ATS platforms, which answer True.
     """
+    try:
+        from cuda.bindings import runtime as cuda_rt
+
+        attr = int(cuda_rt.cudaDeviceAttr.cudaDevAttrPageableMemoryAccess)
+        err, val = cuda_rt.cudaDeviceGetAttribute(
+            attr, torch.cuda.current_device()
+        )
+        if int(err) != 0:
+            logger.warning(
+                "engram host table: cudaDeviceGetAttribute"
+                "(PageableMemoryAccess) failed with %s; assuming the GPU "
+                "cannot reach unpinned host memory",
+                err,
+            )
+            return False
+        return bool(val)
+    except ImportError:
+        pass
+    except Exception as e:  # cuda not initialized, driver mismatch, ...
+        logger.warning(
+            "engram host table: cannot query PageableMemoryAccess (%s); "
+            "falling back to ctypes/libcudart",
+            e,
+        )
     try:
         cudart = ctypes.CDLL("libcudart.so")
     except OSError:
-        return None
+        logger.warning(
+            "engram host table: neither cuda.bindings nor libcudart could "
+            "query PageableMemoryAccess; assuming the GPU cannot reach "
+            "unpinned host memory"
+        )
+        return False
     val = ctypes.c_int(0)
-    CUDART_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS = 135
+    # Mirror driver_types.h cudaDevAttrPageableMemoryAccess; only used when
+    # cuda.bindings (which owns the enum) is unavailable.
+    CUDART_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS = 88
     rc = cudart.cudaDeviceGetAttribute(
         ctypes.byref(val),
         CUDART_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
         ctypes.c_int(torch.cuda.current_device()),
     )
     if rc != 0:
-        return None
+        logger.warning(
+            "engram host table: libcudart cudaDeviceGetAttribute failed "
+            "with rc=%d; assuming the GPU cannot reach unpinned host memory",
+            rc,
+        )
+        return False
     return bool(val.value)
 
 
