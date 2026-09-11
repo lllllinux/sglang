@@ -1050,17 +1050,12 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
-        # Mirror eagle_prepare_for_decode: evict out-of-window SWA KV and
-        # advance decode_batch_idx (the eviction gate requires >= 1). Without
-        # this, hybrid-SWA models retain SWA KV for every generated token and
-        # a single request exhausts the SWA pool after
-        # swa_full_tokens_ratio * max_total_num_tokens generated tokens, at
-        # which point the scheduler retracts it. Pool sizing already assumes
-        # this eviction runs (pool_configurator: trailing_tokens =
-        # window + eviction_interval * draft_tokens + page_size).
-        batch.maybe_evict_swa()
-        for r in batch.reqs:
-            r.decode_batch_idx += 1
+        # SWA eviction and the decode_batch_idx tick are owned by
+        # DFlashDraftInputV2.prepare_for_decode (upstream #33676), which
+        # dispatch reaches below. Do not repeat them here: a second eviction
+        # in the same iteration would see decode_batch_idx >= 1 and bypass
+        # the overlap first-round guard in maybe_evict_swa, freeing SWA
+        # slots while the previous extend batch may still be running.
         batch.spec_info.prepare_for_decode(batch)
     elif batch.spec_algorithm.is_uno():
         from sglang.srt.speculative.uno_info import UnoDraftInput

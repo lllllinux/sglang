@@ -63,9 +63,8 @@ _OWNER_SITES = {
     ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_extend", "kv_committed_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode", "evict"): 1,
-    # spec: the dflash-family branch mirrors eagle_prepare_for_decode.
-    ("speculative/spec_utils.py", "spec_prepare_for_decode", "decode_batch_idx"): 1,
-    ("speculative/spec_utils.py", "spec_prepare_for_decode", "evict"): 1,
+    # spec dispatcher: pure routing -- the dflash/uno draft inputs and
+    # eagle_prepare_for_decode each own their eviction + tick (below).
     ("mem_cache/allocation.py", "alloc_for_decode", "kv_allocated_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode", "kv_committed_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.

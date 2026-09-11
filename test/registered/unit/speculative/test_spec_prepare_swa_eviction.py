@@ -1,19 +1,27 @@
-"""spec_prepare_for_decode must run SWA eviction on the dflash-family path.
+"""dflash-family decode bookkeeping ownership: exactly one eviction + tick.
 
-The dflash-family branch (DFLASH, DSPARK) historically skipped both
-``maybe_evict_swa`` and the ``decode_batch_idx`` tick that
-``eagle_prepare_for_decode`` performs. On hybrid-SWA models that retained
-SWA KV for every generated token, so a single request exhausted the SWA pool
-after ``swa_full_tokens_ratio * max_total_num_tokens`` generated tokens and
-was retracted by the scheduler. Pool sizing assumes the eviction runs
-(``pool_configurator``: ``trailing_tokens = sliding_window +
-eviction_interval * draft_tokens + page_size``).
+The dflash-family dispatcher branch (DFLASH, DSPARK) routes decode
+preparation to DFlashDraftInputV2.prepare_for_decode (upstream #33676),
+which owns both ``maybe_evict_swa`` and the ``decode_batch_idx`` tick --
+mirroring eagle_prepare_for_decode. The dispatcher must NOT repeat either:
+a second eviction in the same iteration would see ``decode_batch_idx >= 1``
+and bypass the overlap first-round guard in maybe_evict_swa, freeing SWA
+slots while the previous extend batch may still be running (pool sizing
+assumes the eviction runs -- pool_configurator: trailing_tokens =
+sliding_window + eviction_interval * draft_tokens + page_size).
+
+These tests drive the REAL DFlashDraftInputV2.prepare_for_decode and the
+REAL maybe_evict_swa; only allocator/tensor-buffer externals are stubbed.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,7 +37,99 @@ def _make_batch(spec_is_dflash_family: bool, spec_is_uno: bool = False):
     return batch, req
 
 
+def _make_real_dflash_batch():
+    """A batch that runs the REAL ScheduleBatch.maybe_evict_swa and the REAL
+    DFlashDraftInputV2.prepare_for_decode, with only allocator externals
+    (alloc_for_spec_decode) stubbed. A wrapper around the real _evict_swa
+    records the decode_batch_idx each eviction observed."""
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+    batch = MagicMock()
+    batch.spec_algorithm.is_dflash_family.return_value = True
+    batch.spec_algorithm.is_uno.return_value = False
+    batch.batch_size.return_value = 1
+    batch.device = torch.device("cpu")
+    # Route to the real eviction so the ownership under test is exercised.
+    batch.maybe_evict_swa.side_effect = lambda: ScheduleBatch.maybe_evict_swa(
+        batch
+    )
+    batch.tree_cache.supports_swa.return_value = True
+    batch.tree_cache.sliding_window_size = 4
+    batch.tree_cache.dec_swa_lock_only = MagicMock()
+    batch.tree_cache.is_chunk_cache.return_value = False
+    batch.tree_cache.swa_retain_floor = MagicMock(return_value=None)
+    batch.req_to_token_pool = MagicMock()
+    batch.req_to_token_pool.req_to_token = torch.zeros((1, 64), dtype=torch.int64)
+    batch.forward_mode.is_decode.return_value = True
+    batch.token_to_kv_pool_allocator.page_size = 1
+    batch.tree_cache.page_size = 1
+    batch.token_to_kv_pool_allocator.free_group_begin = MagicMock()
+    batch.token_to_kv_pool_allocator.free_group_end = MagicMock()
+
+    req = SimpleNamespace(
+        decode_batch_idx=0,
+        seqlen=64,
+        # Real ReqKvInfo shape so free_swa_out_of_window_slots runs for real:
+        # holds_kv is req_pool_idx-derived; the eviction window is
+        # [swa_dead_lo, seqlen-1-window) beyond swa_evicted_seqlen.
+        kv=SimpleNamespace(
+            req_pool_idx=0,
+            cache_protected_len=0,
+            kv_committed_len=32,
+            kv_allocated_len=32,
+            swa_evict_floor=0,
+            swa_evicted_seqlen=0,
+        ),
+        swa_prefix_lock_released=False,
+        swa_uuid_for_lock=None,
+        last_node=None,
+        skip_lock_node_ids=None,
+        # Read by the real DFlashDraftInputV2.prepare_for_decode:
+        sampling_params=SimpleNamespace(top_k=1),
+    )
+    batch.reqs = [req]
+    batch.req_pool_indices = torch.zeros((1,), dtype=torch.int64)
+    batch.seq_lens = torch.tensor([32], dtype=torch.int64)
+
+    batch.spec_info = DFlashDraftInputV2(
+        topk_p=torch.empty((1, 1)),
+        topk_index=torch.empty((1, 1), dtype=torch.int64),
+        bonus_tokens=torch.empty((1,), dtype=torch.int64),
+        new_seq_lens=torch.empty((1,), dtype=torch.int64),
+        hidden_states=torch.empty((1, 1)),
+    )
+    return batch, req
+
+
 class TestSpecPrepareSwaEviction(CustomTestCase):
+    def setUp(self):
+        # The real DFlashDraftInputV2.prepare_for_decode reads the spec bag
+        # (speculative_num_draft_tokens); publish a minimal ServerArgs with
+        # DSPARK configured, and restore the prior context afterwards.
+        from sglang.srt.runtime_context import (
+            get_context,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        self._reset_context = reset_context
+        self._saved_server_args = get_context()._server_args
+        get_context().set_server_args(
+            ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=4,
+            )
+        )
+
+    def tearDown(self):
+        if self._saved_server_args is None:
+            self._reset_context()
+        else:
+            from sglang.srt.runtime_context import get_context
+
+            get_context().set_server_args(self._saved_server_args)
+
     def _run(self, batch):
         from sglang.srt.speculative import spec_utils
 
@@ -39,16 +139,38 @@ class TestSpecPrepareSwaEviction(CustomTestCase):
             spec_utils.spec_prepare_for_decode(batch)
 
     def test_dflash_family_evicts_and_ticks(self):
-        batch, req = _make_batch(spec_is_dflash_family=True)
-        self._run(batch)
-        batch.maybe_evict_swa.assert_called_once_with()
+        """The real chain evicts exactly once per iteration and ticks once:
+        eviction must observe the PRE-tick clock (idx 0 on the first
+        iteration), which is what keeps the overlap first-round guard
+        intact. If the dispatcher ever duplicates the bookkeeping again,
+        the second eviction sees idx >= 1 and this test fails."""
+        batch, req = _make_real_dflash_batch()
+        seen_idx = []
+        real_evict = ScheduleBatch._evict_swa
+
+        def _record(b, *a, **kw):
+            seen_idx.append(req.decode_batch_idx)
+            return real_evict(b, *a, **kw)
+
+        with (
+            patch.object(ScheduleBatch, "_evict_swa", _record),
+            patch("sglang.srt.mem_cache.allocation.alloc_for_spec_decode"),
+            patch(
+                "sglang.srt.speculative.dflash_info_v2._get_overlap_plan_stream",
+                return_value=(None, contextlib.nullcontext()),
+            ),
+        ):
+            self._run(batch)
         self.assertEqual(req.decode_batch_idx, 1)
-        batch.spec_info.prepare_for_decode.assert_called_once_with(batch)
+        # Exactly one eviction, and it saw the pre-tick clock.
+        self.assertEqual(seen_idx, [0])
+        # The real eviction did run (swa_evicted_seqlen advanced).
+        self.assertGreater(req.kv.swa_evicted_seqlen, 0)
 
     def test_tick_advances_every_iteration(self):
         """decode_batch_idx is a clock, not a flag: it must keep advancing so
         the SWA leaf-lock release gate (decode_batch_idx >= sliding_window_size)
-        can fire."""
+        can fire -- but once per iteration, not twice."""
         batch, req = _make_batch(spec_is_dflash_family=True)
         self._run(batch)
         self._run(batch)
@@ -58,12 +180,19 @@ class TestSpecPrepareSwaEviction(CustomTestCase):
     def test_dflash_family_evicts_before_tick(self):
         """The overlap-scheduler gate (decode_batch_idx >= 1) must see the
         pre-tick value, exactly as in eagle_prepare_for_decode."""
-        batch, req = _make_batch(spec_is_dflash_family=True)
+        batch, req = _make_real_dflash_batch()
         seen_idx = []
         batch.maybe_evict_swa.side_effect = lambda: seen_idx.append(
             req.decode_batch_idx
         )
-        self._run(batch)
+        with (
+            patch("sglang.srt.mem_cache.allocation.alloc_for_spec_decode"),
+            patch(
+                "sglang.srt.speculative.dflash_info_v2._get_overlap_plan_stream",
+                return_value=(None, contextlib.nullcontext()),
+            ),
+        ):
+            self._run(batch)
         self.assertEqual(seen_idx, [0])
         self.assertEqual(req.decode_batch_idx, 1)
 
