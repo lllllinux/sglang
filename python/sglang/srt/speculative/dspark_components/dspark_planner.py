@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
+    _value_independent_descending_order,
     compute_sort_survival,
 )
 from sglang.srt.distributed.utils import all_gather_single
@@ -63,6 +64,16 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     # The iteration's plan of `verify_cache_loc`: the draft block, the verify
     # and the target-hidden KV writes all take their ids from it.
     kv_loc_plan: KVLocPlan
+
+
+class ContextCost(msgspec.Struct, frozen=True):
+    """A batch's context cost under an SPS table that prices context: the
+    per-step part, each request's cost per verify token (batch order) and the
+    cost of each padding token in the executed tier."""
+
+    step_seconds: float
+    token_seconds: torch.Tensor
+    pad_token_seconds: float = 0.0
 
 
 class DSparkVerifyPlanner:
@@ -133,6 +144,8 @@ class DSparkVerifyPlanner:
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
+        self._sps_measurement_verify_all: Optional[bool] = None
+        self._sps_measurement_survival_eps: Optional[float] = None
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
@@ -162,6 +175,9 @@ class DSparkVerifyPlanner:
                 cfg=self._schedule_cfg,
                 model_runner=self.model_runner,
                 relay_lag_steps=relay_lag_steps,
+            )
+            self._budget_planner.fill_tiers = bool(
+                self._align_verify_tokens_to_graph_tier
             )
             self._dynamic_graph_tier = not is_dp_attention_enabled()
             self._dp_tier_gather_enabled = (
@@ -257,7 +273,9 @@ class DSparkVerifyPlanner:
             return
         resolved = future_map.resolve_confidence_cpu(batch)
         draft_input.verify_token_budget = self._budget_from_resolved(
-            resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
+            resolved=resolved,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            context_cost=self.batch_context_cost(batch),
         )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
@@ -285,6 +303,10 @@ class DSparkVerifyPlanner:
         all_gather_single(gathered, local_tensor, group=cpu_group)
         batch.global_spec_verify_tier_num_tokens = gathered.tolist()
 
+    def reset_request_history(self) -> None:
+        if self._budget_planner is not None:
+            self._budget_planner.reset_request_history()
+
     def note_non_decode_step(self) -> None:
         if self._budget_planner is not None:
             self._budget_planner.note_non_decode_step()
@@ -293,12 +315,48 @@ class DSparkVerifyPlanner:
         if self._budget_planner is not None:
             self._budget_planner.forced_budget_frac = frac
 
+    def install_sps_table(self, table: SpsAdditiveCostTable, *, source: str) -> None:
+        """Every TP rank must install the same table: budgets are computed per
+        rank."""
+        if self._budget_planner is None:
+            raise RuntimeError(
+                "DSpark SPS table install requires the ragged-verify scheduler."
+            )
+        self._budget_planner.sps_table = table
+        self._budget_planner.last_decision = None
+        self._is_verify_all = False
+        if self._sps_measurement_verify_all is not None:
+            self._sps_measurement_verify_all = False
+        self._uniform_layout_cache.clear()
+        if get_parallel().tp_rank == 0:
+            logger.info("DSpark SPS table installed (sps_table=%s).", source)
+
+    def set_sps_measurement(self, on: bool) -> None:
+        """While the startup SPS measurement runs, schedule verify lengths even
+        with a flat table, so the pinned budget decides each step's tier."""
+        if self._budget_planner is None:
+            return
+        saved = self._sps_measurement_verify_all
+        if on and saved is None:
+            self._sps_measurement_verify_all = self._is_verify_all
+            self._is_verify_all = False
+            # The pinned budget must fill its tier with drafts, so no draft is
+            # left out for low survival: the cell then executes its full width.
+            self._sps_measurement_survival_eps = self._schedule_cfg.survival_eps
+            self._schedule_cfg.survival_eps = 0.0
+        elif not on and saved is not None:
+            self._is_verify_all = saved
+            self._sps_measurement_verify_all = None
+            self._schedule_cfg.survival_eps = self._sps_measurement_survival_eps
+        self._uniform_layout_cache.clear()
+
     def compute_budget_sync(
         self,
         *,
         confidence: torch.Tensor,
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        context_cost: Optional[ContextCost] = None,
     ) -> Optional[int]:
         del prefix_lens
         if self._budget_planner is None:
@@ -312,7 +370,33 @@ class DSparkVerifyPlanner:
             generation=generation,
         )
         return self._budget_from_resolved(
-            resolved=resolved, req_pool_indices_cpu=req_pool_indices_cpu
+            resolved=resolved,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            context_cost=context_cost,
+        )
+
+    def batch_context_cost(self, batch: ScheduleBatch) -> Optional[ContextCost]:
+        """Host request lengths can trail device state by one step under
+        overlap."""
+        if self._budget_planner is None:
+            return None
+        table = self._budget_planner.sps_table
+        if not (isinstance(table, SpsAdditiveCostTable) and table.prices_context):
+            return None
+        reqs = batch.reqs
+        if not reqs:
+            return None
+        lens = [req.seqlen for req in reqs]
+        token_seconds = [table.context_seconds_per_verify_token(n) for n in lens]
+        # With every captured slot taken, RaggedVerifyLayout.padded_to_bucket
+        # appends the tier's padding tokens to the last request's row.
+        max_slots = ragged_capture_max_slots(model_runner=self.model_runner)
+        pads_last_request = max_slots is not None and len(reqs) >= max_slots
+        return ContextCost(
+            step_seconds=sum(table.context_step_seconds_at(n) for n in lens)
+            / len(lens),
+            token_seconds=torch.tensor(token_seconds, dtype=torch.float64),
+            pad_token_seconds=token_seconds[-1] if pads_last_request else 0.0,
         )
 
     def resolve_verify_token_budget(
@@ -322,6 +406,7 @@ class DSparkVerifyPlanner:
         confidence: Optional[torch.Tensor],
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        batch: ScheduleBatch,
     ) -> Optional[int]:
         """Per-step verify-token budget: under overlap it was precomputed into
         the draft input by prepare_verify_budget; otherwise compute it now."""
@@ -336,6 +421,7 @@ class DSparkVerifyPlanner:
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
+            context_cost=self.batch_context_cost(batch),
         )
         return draft_input.verify_token_budget
 
@@ -349,6 +435,7 @@ class DSparkVerifyPlanner:
         *,
         resolved: Optional[ResolvedConfidence],
         req_pool_indices_cpu: torch.Tensor,
+        context_cost: Optional[ContextCost] = None,
     ) -> Optional[int]:
         if resolved is None:
             self._budget_planner.note_non_decode_step()
@@ -362,6 +449,7 @@ class DSparkVerifyPlanner:
                 generation=resolved.generation,
                 current_generation=current_generation,
                 req_pool_indices_cpu=req_pool_indices_cpu,
+                context_cost=context_cost,
             )
         )
 
@@ -378,10 +466,15 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        if (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and self._budget_planner.forced_budget_frac is None
+        ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips.
+            # the per-step schedule and its host<->device round-trips. A pinned
+            # budget (dspark_sps_profiler --fracs) must still be scheduled.
             key = (int(req_pool_indices.shape[0]), global_num_reqs)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
@@ -857,6 +950,8 @@ def compute_verify_token_budget(
     history_survival_probs: torch.Tensor,
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
+    context_cost: Optional[ContextCost] = None,
+    fill_tiers: bool = True,
 ) -> VerifyBudgetDecision:
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
@@ -874,6 +969,18 @@ def compute_verify_token_budget(
             table=sps_table,
             num_requests=int(num_requests),
             num_budgets=int(tau_star.numel()),
+            context_cost=context_cost,
+            context_cum=(
+                None
+                if context_cost is None
+                else _context_cumulative_seconds(
+                    history_survival_probs=history_survival_probs,
+                    context_cost=context_cost,
+                    cfg=cfg,
+                )
+            ),
+            fill_tiers=fill_tiers,
+            verify_width=max_len,
         )
         theta = tau_star / step_time
         idx = int(torch.argmax(theta))
@@ -902,9 +1009,51 @@ def _lookup_sps_tensor(
     return sps[idx]
 
 
-def _additive_step_time_tensor(
-    *, table: SpsAdditiveCostTable, num_requests: int, num_budgets: int
+def _context_cumulative_seconds(
+    *,
+    history_survival_probs: torch.Tensor,
+    context_cost: ContextCost,
+    cfg: DSparkScheduleConfig,
 ) -> torch.Tensor:
+    """Entry k: context seconds of the requests' first tokens plus the next k
+    drafts in allocation order (by survival)."""
+    num_requests = history_survival_probs.shape[0]
+    survival = history_survival_probs[:, : cfg.resolved_max_verify_len()]
+    cols = survival.shape[1]
+    rows = torch.arange(num_requests).repeat_interleave(cols)
+    # The allocator's own order, ties included (position, then request).
+    valid = survival.reshape(-1) >= cfg.survival_eps
+    order = _value_independent_descending_order(
+        probs=survival.reshape(-1).to(torch.float64),
+        positions=torch.arange(cols).repeat(num_requests),
+        requests=rows,
+        valid=valid,
+    )
+    token = context_cost.token_seconds.to(torch.float64)
+    # Drafts under the survival cutoff are never allocated; a tier filled past
+    # the valid ones is padding.
+    per_draft = torch.where(
+        valid[order],
+        token[rows[order]],
+        torch.tensor(context_cost.pad_token_seconds, dtype=torch.float64),
+    )
+    return torch.cat(
+        [torch.zeros(1, dtype=torch.float64), torch.cumsum(per_draft, 0)]
+    ) + float(token.sum())
+
+
+def _additive_step_time_tensor(
+    *,
+    table: SpsAdditiveCostTable,
+    num_requests: int,
+    num_budgets: int,
+    fill_tiers: bool = True,
+    verify_width: int = 0,
+    context_cost: Optional[ContextCost] = None,
+    context_cum: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Step seconds for each budget 0..num_budgets-1, with context priced from
+    ``context_cum`` (see ``_context_cumulative_seconds``) when given."""
     floor = table.bias_seconds + _interp_clamped(
         table.bs_probes, table.alpha_seconds, float(num_requests)
     )
@@ -918,7 +1067,27 @@ def _additive_step_time_tensor(
     span = (m_probes[hi] - m_probes[lo]).clamp_(min=1e-9)
     frac = (m - m_probes[lo]) / span
     theta_at_m = theta_vals[lo] + frac * (theta_vals[hi] - theta_vals[lo])
-    return floor + theta_at_m
+    step = floor + theta_at_m
+    if context_cost is not None and context_cum is not None:
+        verify_tokens = num_requests + torch.arange(num_budgets, dtype=torch.float64)
+        executed = tier_tokens = verify_tokens
+        if table.verify_tiers:
+            tiers = torch.tensor(table.verify_tiers, dtype=torch.float64)
+            idx = torch.bucketize(verify_tokens, tiers).clamp_(max=tiers.numel() - 1)
+            tier_tokens = torch.maximum(tiers[idx], verify_tokens)
+        if fill_tiers and table.verify_tiers:
+            executed = tier_tokens
+            if verify_width:
+                # Alignment fills a tier only with the drafts that exist.
+                executed = torch.minimum(
+                    executed,
+                    torch.clamp(verify_tokens, min=float(num_requests * verify_width)),
+                )
+        k = (executed - num_requests).clamp_(0, context_cum.numel() - 1).long()
+        padding = tier_tokens - executed
+        step = step + context_cum[k] + context_cost.pad_token_seconds * padding
+        step = step + context_cost.step_seconds
+    return step
 
 
 class HostConfidenceBudgetPlanner:
@@ -935,6 +1104,7 @@ class HostConfidenceBudgetPlanner:
         self.cfg = cfg
         self._model_runner = model_runner
         self.forced_budget_frac: Optional[float] = None
+        self.fill_tiers = True
         self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
             int(envs.SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS.get()), 1
@@ -943,6 +1113,13 @@ class HostConfidenceBudgetPlanner:
         self._carry_confidence: Optional[torch.Tensor] = None
         self._carry_generation: Optional[torch.Tensor] = None
         self._carry_pos = 0
+        self.survival_ema = float(envs.SGLANG_DSPARK_BUDGET_SURVIVAL_EMA.get())
+        if not 0.0 < self.survival_ema <= 1.0:
+            raise ValueError(
+                "SGLANG_DSPARK_BUDGET_SURVIVAL_EMA must be in (0, 1], got "
+                f"{self.survival_ema}."
+            )
+        self._solo_ema: Optional[tuple[tuple[int, int], torch.Tensor]] = None
 
     def compute_budget(
         self,
@@ -951,6 +1128,7 @@ class HostConfidenceBudgetPlanner:
         generation: torch.Tensor,
         current_generation: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
+        context_cost: Optional[ContextCost] = None,
     ) -> int:
         lagged_confidence, lagged_generation = self._shift_to_lag(
             confidence=confidence,
@@ -962,6 +1140,12 @@ class HostConfidenceBudgetPlanner:
             lagged_generation=lagged_generation,
             current_generation=current_generation,
         )
+        survival = self._smoothed_survival(
+            survival=survival,
+            lagged_generation=lagged_generation,
+            current_generation=current_generation,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+        )
         forced_frac = self.forced_budget_frac
         if forced_frac is not None:
             full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
@@ -972,6 +1156,8 @@ class HostConfidenceBudgetPlanner:
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
+            context_cost=context_cost,
+            fill_tiers=self.fill_tiers,
         )
         self.last_decision = decision
         return decision.budget
@@ -983,6 +1169,14 @@ class HostConfidenceBudgetPlanner:
 
     def note_non_decode_step(self) -> None:
         self.last_decision = None
+
+    def reset_request_history(self) -> None:
+        """Drop per-row history (lag carry and smoothed survival) when the
+        request pool is cleared and its generations restart."""
+        self._carry_confidence = None
+        self._carry_generation = None
+        self._carry_pos = 0
+        self._solo_ema = None
 
     def _shift_to_lag(
         self,
@@ -1016,6 +1210,37 @@ class HostConfidenceBudgetPlanner:
             (current_gen >= 1) & (lagged_generation.to(torch.int64) == current_gen)
         ).view(-1, 1)
         return torch.where(fresh, k_survival, torch.ones_like(k_survival))
+
+    def _smoothed_survival(
+        self,
+        *,
+        survival: torch.Tensor,
+        lagged_generation: torch.Tensor,
+        current_generation: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """With one running request, size the step from a running average of
+        its lagged survival; allocation still uses the current confidences.
+        With more requests the batch's tier already averages several requests'
+        drafts, so their lagged survival passes through and the average
+        restarts the next time a request runs alone. The average also restarts
+        when the request changes; a request without a fresh lagged survival
+        passes through."""
+        if self.survival_ema >= 1.0:
+            return survival
+        if survival.shape[0] != 1:
+            self._solo_ema = None
+            return survival
+        generation = int(current_generation[0])
+        if generation < 1 or int(lagged_generation[0]) != generation:
+            return survival
+        key = (int(req_pool_indices_cpu[0]), generation)
+        current = survival.to(torch.float32, copy=True)
+        if self._solo_ema is not None and self._solo_ema[0] == key:
+            alpha = self.survival_ema
+            current = self._solo_ema[1].mul(1.0 - alpha).add_(current, alpha=alpha)
+        self._solo_ema = (key, current)
+        return current.clone().to(survival.dtype)
 
     def _ensure_carry(self, *, gamma: int) -> None:
         if self._carry_confidence is not None:

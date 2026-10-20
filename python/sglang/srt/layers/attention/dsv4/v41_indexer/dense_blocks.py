@@ -10,7 +10,6 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax_topk_blocks,
-    candidate_block_mask,
     select_candidate_block_ids,
     topk_among_blocks,
 )
@@ -45,8 +44,6 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
     blocks: torch.Tensor
     # prefill: query rows of each request in row order, for the late-layer tail
     rows_per_request: Optional[List[int]] = None
-    # Hopper decode materializes this once at the source and reuses it in consumers.
-    decode_mask: Optional[torch.Tensor] = None
 
     def tail(self, rows_per_request: List[int]) -> BlockIds:
         assert self.rows_per_request is not None, "prefill block ids missing"
@@ -102,10 +99,7 @@ class DenseBlocksBackend:
             blocks = amax_topk_blocks(
                 d.scores, d.lens, (d.lens + 7) // 8, self.topk_blocks
             )
-            published = BlockIds(
-                blocks=blocks,
-                decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
-            )
+            published = BlockIds(blocks=blocks)
         else:
             published = BlockIds(
                 blocks=select_candidate_block_ids(
@@ -127,13 +121,12 @@ class DenseBlocksBackend:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-            candidate_mask=published.decode_mask if published is not None else None,
+            candidate_blocks=published.blocks if published is not None else None,
         )
         if d is None:
             return
         assert published is not None and published.blocks.shape[0] == d.bs
         if isinstance(d, PagedDecodeScores):
-            assert published.decode_mask is not None
             select_decode(inputs, d, inputs.indexer.index_topk)
             return
         k = min(inputs.indexer.index_topk, d.lmax)
@@ -253,7 +246,13 @@ def _publish_prefill_blocks(
     blocks = torch.full(
         (data.num_rows, width), -1, dtype=torch.int32, device=selected.device
     )
-    for tile, logits in score_tiles(data, kv):
+    # Block-aligned slices of `_publish_tile_blocks` stay within the logits width.
+    assert FLAT_LOGITS_WIDTH_ALIGN % block_size == 0
+    for tile, logits in score_tiles(
+        data,
+        kv,
+        scratch_bytes=lambda w: _publish_scratch_bytes(w, block_size, topk_blocks),
+    ):
         _publish_tile_blocks(
             data=data,
             tile=tile,
@@ -284,9 +283,12 @@ def _publish_tile_blocks(
 ) -> None:
     lens = data.compress_lens[tile]
     for rows, lc in _requests_in_tile(data, tile):
-        scores = logits[rows, :lc]
+        # Through the request's last block: -inf past each row's length is the
+        # padding select_candidate_block_ids would otherwise add in a copy.
+        width = -(-lc // block_size) * block_size
+        scores = logits[rows, :width]
         scores.masked_fill_(
-            torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
+            torch.arange(width, device=logits.device)[None, :] >= lens[rows, None],
             -torch.inf,
         )
         ids = select_candidate_block_ids(
@@ -309,7 +311,8 @@ def _consume_prefill_blocks(
     selected = data.empty_selection(topk)
     # the block-aligned slices of `_consume_tile_blocks` stay within the logits width
     assert FLAT_LOGITS_WIDTH_ALIGN % block_size == 0
-    for tile, logits in score_tiles(data, kv):
+    scratch = (_consume_scratch_bytes(blocks.shape[1], block_size, topk), 0)
+    for tile, logits in score_tiles(data, kv, scratch_bytes=lambda w: scratch):
         _consume_tile_blocks(
             data=data,
             tile=tile,
@@ -347,6 +350,28 @@ def _consume_tile_blocks(
         out[rows] = torch.where(positions >= 0, positions + starts[rows, None], -1).to(
             torch.int32
         )
+
+
+def _publish_scratch_bytes(
+    width: int, block_size: int, topk_blocks: int
+) -> Tuple[int, int]:
+    """Scratch of ``_publish_tile_blocks`` for a tile ``width`` wide, as bytes a
+    row and bytes a tile. A row: the bool causal mask (a byte a column), the block
+    maxima (counted as fp32), their masked copy and the newest-block mask (9 bytes
+    a block), and the top-k over the blocks with its sort (32 bytes a kept block).
+    A tile: one request's int64 column or block indices at a time (8 bytes a column)."""
+    num_blocks = -(-width // block_size)
+    per_row = width + 9 * num_blocks + 32 * min(topk_blocks, num_blocks)
+    return per_row, 8 * width
+
+
+def _consume_scratch_bytes(num_blocks: int, block_size: int, topk: int) -> int:
+    """Per-row scratch of ``_consume_tile_blocks``, whatever the tile width:
+    ``topk_among_blocks``'s gathered candidates and the two bool masks its drop
+    mask is built from (6 bytes a candidate position), its int64 block ids,
+    clamped ids, room and their temporaries (40 bytes a block), and the int64
+    picks with their transforms (96 bytes a pick)."""
+    return num_blocks * (6 * block_size + 40) + 96 * topk
 
 
 def _requests_in_tile(data: DeepGEMMPrefillData, tile: slice):

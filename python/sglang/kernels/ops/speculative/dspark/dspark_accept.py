@@ -49,6 +49,7 @@ class AcceptSampling:
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         block_verification: bool = False,
+        padding_verify_lens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling(
             candidates=candidates,
@@ -60,6 +61,7 @@ class AcceptSampling:
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            padding_verify_lens=padding_verify_lens,
         )
 
     @classmethod
@@ -75,6 +77,7 @@ class AcceptSampling:
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         block_verification: bool = False,
+        padding_verify_lens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling_triton(
             candidates=candidates,
@@ -86,6 +89,7 @@ class AcceptSampling:
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            padding_verify_lens=padding_verify_lens,
         )
 
 
@@ -100,6 +104,7 @@ def _accept_sampling_core(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
     block_verification: bool,
+    padding_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -117,6 +122,7 @@ def _accept_sampling_core(
             bs=bs,
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
+            padding_verify_lens=padding_verify_lens,
         )
     (
         retrieve_index,
@@ -178,6 +184,7 @@ def accept_sampling(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     block_verification: bool = False,
+    padding_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -191,6 +198,7 @@ def accept_sampling(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         block_verification=block_verification,
+        padding_verify_lens=padding_verify_lens,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
@@ -248,6 +256,7 @@ def accept_sampling_triton(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     block_verification: bool = False,
+    padding_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
         candidates=candidates,
@@ -259,6 +268,7 @@ def accept_sampling_triton(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         block_verification=block_verification,
+        padding_verify_lens=padding_verify_lens,
     )
     bonus = gather_two_level_bonus_triton(
         accept_index=accept_index, predicts=predicts, correct_len=correct_len

@@ -110,6 +110,7 @@ from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_cuda_graph_batch_size_alignment,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -226,6 +227,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     dllm_input_preparation = None
     dllm_attention = None
+
+    # Draft runners that build their own state without __init__ never capture
+    # ragged-verify tiers.
+    ragged_verify_mode: bool = False
 
     def __init__(
         self,
@@ -559,9 +564,36 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.shared_read_done_event = read_done
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
-        buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
+        buckets = {bs * self.captured_req_width for bs in self.capture_bs}
+        if envs.SGLANG_RAGGED_VERIFY_SUB_WIDTH_TIERS.get():
+            if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
+                raise ValueError(
+                    "SGLANG_RAGGED_VERIFY_SUB_WIDTH_TIERS cannot be combined with "
+                    "SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE, whose captures "
+                    "hold whole requests only."
+                )
+            # Same token alignment as the width tiers' batch sizes.
+            alignment = get_cuda_graph_batch_size_alignment()
+            buckets |= {
+                n for n in range(1, self.captured_req_width) if n % alignment == 0
+            }
+        buckets = sorted(buckets)
         assert buckets and buckets[0] > 0, f"{buckets=}"
         return buckets
+
+    def _capture_shapes(self) -> list[tuple[int, Optional[int]]]:
+        """(batch size, token tier) per capture, largest first. The token tier is
+        set only for ragged-verify tiers smaller than one request's width."""
+        shapes = [(bs, None) for bs in reversed(self.capture_bs)]
+        if self.ragged_verify_mode:
+            width_tiers = {bs * self.captured_req_width for bs in self.capture_bs}
+            shapes += [
+                (self._ragged_capture_slots(num_tokens), num_tokens)
+                for num_tokens in sorted(
+                    set(self.capture_num_tokens) - width_tiers, reverse=True
+                )
+            ]
+        return shapes
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
@@ -658,8 +690,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:
             return None
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return None
+        # Forced-uniform capture still carries a layout, of full-width rows
+        # (_ragged_capture_slots): a capture without one would record uniform
+        # attention geometry that a packed replay cannot refresh.
         layout = self._captured_ragged_layouts.get(num_tokens)
         if layout is not None:
             return layout
@@ -834,15 +867,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int],
         variant_label: Optional[str],
         attention_variant: Optional[str],
+        tokens: Optional[int] = None,
     ) -> None:
         """Name the trace for one capture. bs alone is not unique: the capture
         loop multiplies it by the lora and attention variants (DSA captures
         dense + sparse per bs). Absent variants are omitted so single-variant
-        runners keep the historical `bs_<n>` stem.
+        runners keep the historical `bs_<n>` stem; a sub-width ragged-verify
+        capture is named by its token count.
         """
         if getattr(self, "_profiler", None) is None:
             return
-        parts = [f"bs_{bs}"]
+        parts = [f"bs_{bs}" if tokens is None else f"tokens_{tokens}"]
         if attention_variant is not None:
             parts.append(attention_variant)
         if variant_label is not None:
@@ -1178,18 +1213,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             empty_cache=False,
         )
         # Reverse so cuda graphs share memory better.
-        capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
-            if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
-        )
+        shapes = self._capture_shapes()
+        capture_range = tqdm.tqdm(shapes) if get_parallel().tp_rank == 0 else shapes
         lora_variants = (
             [("lora", True), ("nolora", False)]
             if self.record_nolora_graph
             else [(None, None)]
         )
         variants = self.attention_graph_variants
-        for bs in capture_range:
+        for bs, sub_width_tokens in capture_range:
             attention_variants = (
                 variants.capture_labels if variants is not None else (None,)
             )
@@ -1199,8 +1231,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self.model_runner.gpu_id,
                     empty_cache=False,
                 )
+                shape = f"{bs=}" if sub_width_tokens is None else f"{sub_width_tokens=}"
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    f"Capturing batches ({shape} {avail_mem=:.2f} GB)"
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
@@ -1208,20 +1241,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 for attention_variant in attention_variants:
                     _set_capture_attention_variant(attention_variant)
                     self._set_profile_trace_tag(
-                        bs, stream_idx, variant_label, attention_variant
+                        bs,
+                        stream_idx,
+                        variant_label,
+                        attention_variant,
+                        tokens=sub_width_tokens,
                     )
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
+                        sub_width_tokens is None and bs in self.compile_bs,
+                        num_tokens=sub_width_tokens or bs * self.captured_req_width,
                         tp_group=get_parallel().tp_group,
                     ) as forward:
+                        # Only sub-width shapes pass a token count, so overrides
+                        # without the keyword keep working.
                         self.capture_one_shape(
                             bs,
                             forward,
                             stream_idx,
                             variant_label,
                             attention_variant,
+                            **(
+                                {}
+                                if sub_width_tokens is None
+                                else {"capture_num_tokens": sub_width_tokens}
+                            ),
                         )
         _set_capture_attention_variant(None)
 
@@ -1232,8 +1276,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
+        capture_num_tokens: Optional[int] = None,
     ):
-        num_tokens = size * self.captured_req_width
+        num_tokens = (
+            size * self.captured_req_width
+            if capture_num_tokens is None
+            else capture_num_tokens
+        )
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.

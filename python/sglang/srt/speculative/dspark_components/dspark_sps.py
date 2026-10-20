@@ -60,11 +60,25 @@ def _interp_clamped(xs: list[int], ys: list[float], x: float) -> float:
 
 
 class SpsAdditiveCostTable(msgspec.Struct, frozen=True):
+    """Baseline step time ``bias + alpha(bs) + theta(M)`` for ``bs`` requests
+    and ``M`` verify tokens, plus context costs per step
+    (``context_step_seconds``) and per verify token (``context_seconds``), each
+    in seconds per context token, with the ``*_beyond`` slopes past
+    ``context_knee_tokens``. The planner prices context per request using
+    the compact verify layout.
+    """
+
     bias_seconds: float
     bs_probes: list[int]
     alpha_seconds: list[float]
     m_probes: list[int]
     theta_seconds: list[float]
+    context_seconds: float = 0.0
+    verify_tiers: list[int] = []
+    context_knee_tokens: int = 0
+    context_seconds_beyond: float = 0.0
+    context_step_seconds: float = 0.0
+    context_step_seconds_beyond: float = 0.0
 
     def __post_init__(self) -> None:
         for name, probes, values in (
@@ -84,6 +98,61 @@ class SpsAdditiveCostTable(msgspec.Struct, frozen=True):
                 )
         if self.bias_seconds <= 0:
             raise ValueError(f"bias_seconds must be > 0, got {self.bias_seconds}.")
+        if not (0.0 <= self.context_seconds < float("inf")):
+            raise ValueError(
+                f"context_seconds must be finite and >= 0, got {self.context_seconds}."
+            )
+        for name in ("context_step_seconds", "context_step_seconds_beyond"):
+            if not (0.0 <= getattr(self, name) < float("inf")):
+                raise ValueError(
+                    f"{name} must be finite and >= 0, got {getattr(self, name)}."
+                )
+        if not (0.0 <= self.context_seconds_beyond < float("inf")):
+            raise ValueError(
+                "context_seconds_beyond must be finite and >= 0, got "
+                f"{self.context_seconds_beyond}."
+            )
+        if self.context_knee_tokens < 0:
+            raise ValueError(
+                f"context_knee_tokens must be >= 0, got {self.context_knee_tokens}."
+            )
+        if self.verify_tiers and (
+            self.verify_tiers != sorted(set(self.verify_tiers))
+            or self.verify_tiers[0] < 1
+        ):
+            raise ValueError(
+                "verify_tiers must be strictly increasing positive token counts, "
+                f"got {self.verify_tiers}."
+            )
+
+    @property
+    def prices_context(self) -> bool:
+        knee = bool(self.context_knee_tokens)
+        return bool(
+            self.context_seconds
+            or self.context_step_seconds
+            or (
+                knee
+                and (self.context_seconds_beyond or self.context_step_seconds_beyond)
+            )
+        )
+
+    def _piecewise(self, near: float, beyond: float, context_tokens: float) -> float:
+        ctx = max(float(context_tokens), 0.0)
+        knee = self.context_knee_tokens
+        if knee <= 0 or ctx <= knee:
+            return near * ctx
+        return near * knee + beyond * (ctx - knee)
+
+    def context_step_seconds_at(self, context_tokens: float) -> float:
+        return self._piecewise(
+            self.context_step_seconds, self.context_step_seconds_beyond, context_tokens
+        )
+
+    def context_seconds_per_verify_token(self, context_tokens: float) -> float:
+        return self._piecewise(
+            self.context_seconds, self.context_seconds_beyond, context_tokens
+        )
 
     def step_time(self, *, num_reqs: int, budget: int) -> float:
         return (

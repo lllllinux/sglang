@@ -473,6 +473,7 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             local_width=per_partition,
             prefer_nvlink=self._is_dsv41
             and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+            prefer_pcie_ipc=self._is_dsv41,
         )
         if shard_group.rank == 0:
             cls_name = type(vocab_gather).__name__
@@ -685,6 +686,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
+    # The draft reads the target checkpoint, Engram files included.
+    host_resident_weight_patterns = DeepseekV4ForCausalLM.host_resident_weight_patterns
 
     @classmethod
     def shared_experts_fusion_disable_reason(

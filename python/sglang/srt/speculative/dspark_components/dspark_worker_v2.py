@@ -157,6 +157,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
+        self._sps_autotune = None
+        self._sps_autotune_installed: Optional[str] = None
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
@@ -545,7 +547,77 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        # The request pool's generations restart from zero, so per-row history
+        # keyed by (row, generation) would match unrelated new requests.
+        planner = self.__dict__.get("_verify_planner")
+        if planner is not None:
+            planner.reset_request_history()
+
+    def post_capture_init(self) -> None:
+        if not self._hosts_draft:
+            return
+        from sglang.srt.speculative.dspark_components.dspark_sps_autotune import (
+            maybe_autotune_sps_table,
+        )
+
+        self._sps_autotune = maybe_autotune_sps_table(
+            planner=self._verify_planner,
+            target_model_runner=self.model_runner,
+            draft_model_runner=self.draft_model_runner,
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            simulate_acc_len=self._simulate_acc_len,
+            draft_sampler=self._draft_sampler,
+        )
+
+    def sps_autotune_status(self) -> Optional[dict]:
+        if self._sps_autotune is not None:
+            return self._sps_autotune.status()
+        if self._sps_autotune_installed is not None:
+            return {"pending": False, "installed": self._sps_autotune_installed}
+        return None
+
+    def set_sps_autotune_recording(self, on: bool) -> None:
+        if self._sps_autotune is None:
+            return
+        self._observers.set_sps_recording(on)
+        self._verify_planner.set_sps_measurement(on)
+        self._verify_executor.bonus_only = on
+
+    def install_sps_autotune_table(self, payload: Optional[str]) -> bool:
+        """Install the measured SPS table (``None`` abandons the measurement).
+        Every TP rank runs this in the same scheduler iteration."""
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.speculative.dspark_components.dspark_sps_autotune import (
+            install_measured_table,
+        )
+
+        prepared = self._sps_autotune
+        if prepared is None:
+            return False
+        self._sps_autotune = None
+        self.set_dspark_forced_budget_frac(None)
+        self._observers.set_sps_recording(False)
+        self._verify_planner.set_sps_measurement(False)
+        self._verify_executor.bonus_only = False
+        if payload is None:
+            if get_parallel().tp_rank == 0:
+                logger.warning(
+                    "DSpark SPS autotune abandoned; keeping the configured table."
+                )
+            return False
+        group = get_parallel().tp_group
+        installed = install_measured_table(
+            payload=payload,
+            prepared=prepared,
+            group=group.cpu_group if group.world_size > 1 else None,
+            install=lambda table, source: self._verify_planner.install_sps_table(
+                table, source=source
+            ),
+        )
+        if installed:
+            self._sps_autotune_installed = f"autotune-measured:{prepared.cache_path}"
+        return installed
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
@@ -913,6 +985,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=batch.req_pool_indices,
+            batch=batch,
         )
 
         layout = self._verify_planner.schedule_layout(
@@ -951,6 +1024,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 simulate_bonus_sampling_info is None
                 or self._verify_executor.verify_epilogue.simulate_fold
             )
+            # The SPS measurement commits bonus tokens only, which the
+            # in-graph accept cannot do.
+            and not self._verify_executor.bonus_only
             and not batch.has_grammar
         )
         self._verify_executor.begin_simulated_step()
@@ -1024,6 +1100,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            compact_padding=run_compact and not batch.has_grammar,
         )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,

@@ -127,6 +127,10 @@ class SchedulerInternalStateController:
             info_record = scheduler.draft_worker.dump_info_records()
             if info_record is not None:
                 state["dspark_info_record"] = info_record
+            autotune = getattr(scheduler.draft_worker, "sps_autotune_status", None)
+            autotune_status = autotune() if autotune is not None else None
+            if autotune_status is not None:
+                state["dspark_sps_autotune"] = autotune_status
 
     def _add_step_times(self, state: Dict[str, Any]) -> None:
         if self.record_step_time:
@@ -182,6 +186,14 @@ class SchedulerInternalStateController:
             "dspark_clear_info_records": _UpdateHandler(
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
+            "dspark_sps_autotune_record": _UpdateHandler(
+                self._validate_dspark_autotune_record,
+                self._apply_dspark_autotune_record,
+            ),
+            "dspark_sps_autotune_table": _UpdateHandler(
+                self._validate_dspark_autotune_table,
+                self._apply_dspark_autotune_table,
+            ),
         }
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
@@ -218,6 +230,24 @@ class SchedulerInternalStateController:
         self._require_dspark_worker(key, "set_dspark_forced_budget_frac")
         if value is not None and not (0.0 < float(value) <= 1.0):
             raise UpdateRejected(f"{key} must be in (0, 1] or null, got {value}.")
+        simulate_acc_len = envs.SGLANG_SIMULATE_ACC_LEN.get()
+        simulate_acc_method = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+        if (
+            value is not None
+            and simulate_acc_len > 0
+            and (simulate_acc_len != 1.0 or simulate_acc_method != "match-expected")
+        ):
+            # A trimmed verify budget breaks the cap-accept accounting of a
+            # simulated accept length above 1, as the DSpark worker checks at
+            # startup for profiled SPS tables. Only match-expected sampling of
+            # 1.0 always yields 1; multinomial draws around the mean.
+            raise UpdateRejected(
+                f"{key} cannot be pinned with SGLANG_SIMULATE_ACC_LEN="
+                f"{simulate_acc_len} and SGLANG_SIMULATE_ACC_METHOD="
+                f"{simulate_acc_method}; only SGLANG_SIMULATE_ACC_LEN=1.0 with "
+                "SGLANG_SIMULATE_ACC_METHOD=match-expected stays within every "
+                "verify budget."
+            )
 
     def _apply_dspark_budget_frac(self, key: str, value: Any) -> None:
         # A worker command, not a server arg: keep it out of the override.
@@ -231,6 +261,30 @@ class SchedulerInternalStateController:
     def _apply_dspark_clear_records(self, key: str, value: Any) -> None:
         if value:
             self.scheduler.draft_worker.clear_info_records()
+
+    def _validate_dspark_autotune_record(self, key: str, value: Any) -> None:
+        self._require_pending_autotune(key)
+        if not isinstance(value, bool):
+            raise UpdateRejected(f"{key} must be true or false, got {value!r}.")
+
+    def _apply_dspark_autotune_record(self, key: str, value: Any) -> None:
+        self.scheduler.draft_worker.set_sps_autotune_recording(value)
+
+    def _validate_dspark_autotune_table(self, key: str, value: Any) -> None:
+        self._require_pending_autotune(key)
+        if value is not None and not isinstance(value, str):
+            raise UpdateRejected(f"{key} must be a JSON string or null.")
+
+    def _apply_dspark_autotune_table(self, key: str, value: Any) -> None:
+        # Every TP rank applies this in the same iteration; the install agrees
+        # across them before any rank uses the table.
+        self.scheduler.draft_worker.install_sps_autotune_table(value)
+
+    def _require_pending_autotune(self, key: str) -> None:
+        self._require_dspark_worker(key, "sps_autotune_status")
+        status = self.scheduler.draft_worker.sps_autotune_status()
+        if not (status and status.get("pending")):
+            raise UpdateRejected(f"{key} requires a pending DSpark SPS autotune.")
 
     def _require_dspark_worker(self, key: str, command: str) -> None:
         if not self.scheduler.spec_algorithm.is_dspark() or not hasattr(

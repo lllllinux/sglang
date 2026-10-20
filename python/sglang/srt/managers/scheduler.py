@@ -1176,6 +1176,11 @@ class Scheduler(
 
         refresh_deep_gemm_layout_memory_budget(model_runner, only_if_initialized=True)
 
+        post_capture_init = getattr(self.draft_worker, "post_capture_init", None)
+        if post_capture_init is not None:
+            with device_module.stream(forward_stream):
+                post_capture_init()
+
         if (
             get_exec().moe.elastic_ep_backend is not None
             and get_exec().moe.ep_join_mode == "recover"

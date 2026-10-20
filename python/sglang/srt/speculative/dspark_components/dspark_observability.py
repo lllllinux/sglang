@@ -182,6 +182,7 @@ class DsparkInfoDumper:
         self._sps_report_interval = int(sps_report_interval)
         if self._sps_report_interval > 0:
             self._components.add(InfoComponent.STEP_GPU_TIME)
+        self._configured_components = set(self._components)
         # Dedup within an attention-TP group only: records describe the
         # DP-rank-local batch, so under dp-attention every DP rank must keep
         # dumping (the SPS profiler reads one payload per DP rank).
@@ -202,6 +203,13 @@ class DsparkInfoDumper:
             InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]
         ] = {}
         self._open_segments: dict[InfoSegment, torch.cuda.Event] = {}
+
+    def set_runtime_components(self, components: set[InfoComponent]) -> None:
+        """Record ``components`` on top of the configured ones until reset with
+        an empty set. Starts from cleared records."""
+        self._components = self._configured_components | set(components)
+        self.enabled = bool(self._components) and self.attn_tp_rank == 0
+        self.clear()
 
     def begin_step(self) -> None:
         if not self.enabled:
@@ -767,7 +775,14 @@ class DsparkStepObservers:
                 "SGLANG_SIMULATE_ACC_LEN (simulated correct_len breaks the "
                 "accept-probability bookkeeping of the estimator)."
             )
-        self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+        self._sts_collect_path = (
+            envs.SGLANG_DSPARK_STS_COLLECT_PATH.get() if tp_rank == 0 else ""
+        )
+        if self._simulate_acc_len > 0 and self._sts_collect_path:
+            raise ValueError(
+                "SGLANG_DSPARK_STS_COLLECT_PATH cannot be combined with "
+                "SGLANG_SIMULATE_ACC_LEN (STS labels come from correct_len)."
+            )
         self._sts_recorder: Optional[StsDataRecorder] = None
 
     # --- step lifecycle -------------------------------------------------
@@ -799,6 +814,13 @@ class DsparkStepObservers:
 
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
+
+    def set_sps_recording(self, on: bool) -> None:
+        """Per-step periods for the startup SPS measurement (the components
+        SGLANG_DSPARK_ENABLE_SPS_RECORD enables)."""
+        self._info_dumper.set_runtime_components(
+            {InfoComponent.CORE, InfoComponent.STEP_CPU_TIME} if on else set()
+        )
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
         if self._block_accept_recorder is None:
@@ -841,10 +863,7 @@ class DsparkStepObservers:
     ) -> None:
         planner = self._planner
         self._maybe_record_sts_collect(
-            confidence_raw=confidence_raw,
-            verify_ids_2d=verify_ids_2d,
-            target_logits=target_logits,
-            bs=bs,
+            confidence_raw=confidence_raw, correct_len=correct_len, layout=layout
         )
         self._confidence_probe.maybe_observe(
             carries_confidence=planner.carries_confidence,
@@ -932,9 +951,8 @@ class DsparkStepObservers:
         self,
         *,
         confidence_raw: Optional[torch.Tensor],
-        verify_ids_2d: torch.Tensor,
-        target_logits: Optional[torch.Tensor],
-        bs: int,
+        correct_len: torch.Tensor,
+        layout,
     ) -> None:
         if not self._sts_collect_path:
             return
@@ -946,14 +964,10 @@ class DsparkStepObservers:
                 gamma=self._gamma,
                 flush_every=_STS_COLLECT_FLUSH_EVERY,
             )
-        target_predict = torch.argmax(target_logits, dim=-1).view(
-            bs, self._verify_num_draft_tokens
-        )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=verify_ids_2d,
-            target_predict=target_predict,
-        )
+        # Label with the step's actual acceptance (greedy or rejection
+        # sampling), capped at the compact verify window.
         self._sts_recorder.record(
             confidence_raw=confidence_raw,
-            num_correct_drafts=num_correct_drafts,
+            num_correct_drafts=correct_len,
+            verify_lens=None if layout is None else layout.verify_lens,
         )

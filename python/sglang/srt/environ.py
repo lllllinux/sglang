@@ -534,6 +534,11 @@ class Envs:
     # ===================================================================
     # DSpark speculative decoding
     # ===================================================================
+    # Weight of the newest survival in the per-request running average the host
+    # budget planner sizes each step from (1.0 = only the newest). The budget is
+    # decided from confidences RELAY_LAG_STEPS old, and one request's drafts vary
+    # a lot from step to step, so an average predicts the current draft better.
+    SGLANG_DSPARK_BUDGET_SURVIVAL_EMA = EnvFloat(1.0)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
@@ -560,6 +565,21 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # DSpark SPS autotune.
+    SGLANG_DSPARK_SPS_AUTOTUNE_CACHE_DIR = EnvStr(
+        lambda: _default_cache_subdir("dspark_sps")
+    )
+    SGLANG_DSPARK_SPS_AUTOTUNE_PASSES = EnvInt(2)
+    SGLANG_DSPARK_SPS_AUTOTUNE_WARMUP_STEPS = EnvInt(8)
+    SGLANG_DSPARK_SPS_AUTOTUNE_STEADY_STEPS = EnvInt(64)
+    SGLANG_DSPARK_SPS_AUTOTUNE_CELL_TIMEOUT_SECONDS = EnvFloat(60.0)
+    SGLANG_DSPARK_SPS_AUTOTUNE_MAX_SECONDS = EnvFloat(900.0)
+    SGLANG_DSPARK_SPS_AUTOTUNE_INPUT_LEN = EnvInt(256)
+    SGLANG_DSPARK_SPS_AUTOTUNE_TEMPERATURE = EnvFloat(1.0)
+    SGLANG_DSPARK_SPS_AUTOTUNE_TOP_P = EnvFloat(1.0)
+    SGLANG_DSPARK_SPS_AUTOTUNE_LONG_CONTEXT = EnvInt(32768)
+    SGLANG_DSPARK_SPS_AUTOTUNE_LONG_CONTEXT_FAR = EnvInt(131072)
+    SGLANG_DSPARK_SPS_AUTOTUNE_BATCH_SIZES = EnvStr("")
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1111,6 +1131,11 @@ class Envs:
     # kernels/ops/gemm/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    # SM120: block-FP8 (32x32, UE8M0) linears served as MXFP8 (needs
+    # --fp8-gemm-backend flashinfer_cutlass or flashinfer_cutedsl) run their
+    # tuned decode shapes at up to 16 rows on a Triton GEMM instead of
+    # FlashInfer. Set 0 to keep every row count on FlashInfer.
+    SGLANG_ENABLE_SM120_MXFP8_SKINNY_GEMM = EnvBool(True)
 
     # ===================================================================
     # Humming quantization
@@ -1411,6 +1436,9 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # BF16 LM head (target and DSpark draft) at <= 16 rows through a weight-streaming
+    # Triton kernel instead of cuBLAS; each row's result is independent of the batch.
+    SGLANG_ENABLE_BF16_SKINNY_LM_HEAD = EnvBool(False)
 
     # ===================================================================
     # Deterministic inference and all-reduce
@@ -1467,6 +1495,9 @@ class Envs:
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Also capture ragged verify tiers below one request's width, so a single request
+    # can verify fewer draft tokens than gamma + 1.
+    SGLANG_RAGGED_VERIFY_SUB_WIDTH_TIERS = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
@@ -1625,7 +1656,8 @@ class Envs:
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
-    # low/high/xhigh/max or an integer budget in [1, 100]; unset -> the encoder default.
+    # minimal/low/medium/high/xhigh/max or an integer budget in [1, 100]; unset ->
+    # the encoder default.
     SGLANG_DSV41_REASONING_EFFORT = EnvStr(None)
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
@@ -1751,6 +1783,9 @@ class Envs:
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
     # Emits MXFP8 when wo_b supports it, otherwise BF16.
     SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
+    # SM120: decode/verify wo_a (1-64 rows) reads an exact E4M3 copy of the bf16
+    # weight (+8 MiB per layer per rank); weights without an exact copy keep bf16.
+    SGLANG_DSV41_WO_A_FP8_COPY = EnvBool(True)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.

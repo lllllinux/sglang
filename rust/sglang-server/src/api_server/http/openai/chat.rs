@@ -1,8 +1,8 @@
 //! OpenAI Chat Completions endpoint and chat-template preparation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
@@ -32,7 +32,10 @@ use sglang_processor::{
 
 use super::completions::completion_usage;
 use super::pd_routing::PDRoutingFields;
-use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
+use super::tools::{
+    apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls,
+    tool_call_finish_reason,
+};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
     indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
@@ -462,6 +465,7 @@ pub(super) async fn unary_chat(
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
 
     for (index, call) in submitted {
         let output = match collect_output(call).await {
@@ -475,8 +479,8 @@ pub(super) async fn unary_chat(
             prompt_tokens = output.prompt_tokens;
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        reasoning_tokens = reasoning_tokens.saturating_add(output.reasoning_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
-        let finish_reason = chat_finish_reason(&output);
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
@@ -493,11 +497,7 @@ pub(super) async fn unary_chat(
             parallel_tool_calls,
         )
         .await;
-        let finish_reason = if tool_calls.is_some() {
-            Some(OpenAIFinishReason::ToolCalls)
-        } else {
-            finish_reason
-        };
+        let finish_reason = tool_call_finish_reason(&output, tool_calls.is_some());
         #[allow(deprecated)]
         let message = ChatCompletionResponseMessage {
             content: (!content.is_empty()).then_some(ChatCompletionMessageContent::Text(content)),
@@ -528,6 +528,7 @@ pub(super) async fn unary_chat(
         usage: Some(completion_usage(
             prompt_tokens,
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+            reasoning_tokens,
         )),
     })
     .into_response()
@@ -551,11 +552,17 @@ pub(super) fn chat_event_stream(
     service_tier: Option<ChatServiceTier>,
 ) -> impl futures::Stream<Item = String> {
     let count = submitted.len();
+    // The tool-call stream promotes any stop with tool calls to `tool_calls`;
+    // a choice that ended in an abort did not finish its turn.
+    let aborted = Arc::new(Mutex::new(HashSet::new()));
+    let aborted_in_raw = aborted.clone();
     let raw = async_stream::stream! {
         let count = submitted.len();
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u64;
+        // Running totals per choice: the latest event's value is the choice's.
+        let mut reasoning_tokens_by_choice = vec![0u64; count];
         // One stateful reasoning splitter per choice (Python keeps a
         // `reasoning_parser_dict` per index).
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
@@ -615,7 +622,11 @@ pub(super) fn chat_event_stream(
                 prompt_tokens = output.prompt_tokens;
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+            reasoning_tokens_by_choice[index] = output.reasoning_tokens;
             let finish_reason = chat_finish_reason(&output);
+            if output.finish_reason.as_ref().and_then(|reason| reason.kind_name()) == Some("abort") {
+                aborted_in_raw.lock().unwrap().insert(u32::try_from(index).unwrap_or(u32::MAX));
+            }
             // Split the step's text into (reasoning, normal) deltas when
             // `--reasoning-parser` is set. Mirrors Python's per-step emission:
             // reasoning chunk first (logprobs ride it), then the content chunk.
@@ -723,6 +734,7 @@ pub(super) fn chat_event_stream(
                     usage: Some(completion_usage(
                         prompt_tokens,
                         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                        reasoning_tokens_by_choice.iter().copied().fold(0u64, u64::saturating_add),
                     )),
                 }),
                 id: None,
@@ -754,6 +766,13 @@ pub(super) fn chat_event_stream(
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
             if let Some(response) = item.data.as_mut() {
+                for choice in &mut response.choices {
+                    if choice.finish_reason == Some(OpenAIFinishReason::ToolCalls)
+                        && aborted.lock().unwrap().contains(&choice.index)
+                    {
+                        choice.finish_reason = Some(OpenAIFinishReason::Stop);
+                    }
+                }
                 if !parallel_tool_calls {
                     for choice in &mut response.choices {
                         let index = choice.index as usize;
@@ -857,7 +876,7 @@ fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chat_submitted, chunk};
+    use super::super::test_utils::{chat_submitted, chunk, with_tokens};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
         merge_template_stops, starts_in_reasoning, unary_chat,
@@ -1092,6 +1111,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unary_chat_reports_reasoning_tokens_in_completion_tokens_details() {
+        let (choice0, tx0) = chat_submitted(0, "r0");
+        let (choice1, tx1) = chat_submitted(1, "r1");
+        tx0.send(with_tokens(chunk("r0", "Paris", true), 4, 3))
+            .await
+            .unwrap();
+        tx1.send(with_tokens(chunk("r1", "Paris", true), 6, 4))
+            .await
+            .unwrap();
+
+        let response = unary_chat(
+            vec![choice0, choice1],
+            "chatcmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["usage"]["completion_tokens"], 10);
+        let details = &value["usage"]["completion_tokens_details"];
+        assert_eq!(details["reasoning_tokens"], 7);
+        assert_eq!(details["accepted_prediction_tokens"], 0);
+        assert_eq!(details["rejected_prediction_tokens"], 0);
+        assert_eq!(details["audio_tokens"], 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_final_usage_reports_latest_reasoning_total() {
+        // Each event carries the request's running total, so the final usage
+        // reports the latest value, not their sum.
+        let (choice, tx) = chat_submitted(0, "r0");
+        tx.send(with_tokens(chunk("r0", "Par", false), 3, 2))
+            .await
+            .unwrap();
+        tx.send(with_tokens(chunk("r0", "is", true), 4, 5))
+            .await
+            .unwrap();
+
+        let stream = chat_event_stream(
+            vec![choice],
+            "chatcmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            true,
+            None,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        assert_eq!(frames.last().map(String::as_str), Some("[DONE]"));
+        let usage: Vec<serde_json::Value> = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .filter(|frame| !frame["usage"].is_null())
+            .collect();
+        assert_eq!(usage.len(), 1, "{frames:?}");
+        assert!(usage[0]["choices"].as_array().unwrap().is_empty());
+        assert_eq!(usage[0]["usage"]["completion_tokens"], 7);
+        assert_eq!(
+            usage[0]["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            5
+        );
+    }
+
+    #[tokio::test]
     async fn unary_chat_separates_reasoning_content_with_parser_configured() {
         let (choice, tx) = chat_submitted(0, "r0");
         tx.send(chunk(
@@ -1227,10 +1328,13 @@ mod tests {
         use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
         use crate::message::config::ServerArgs;
         use crate::message::request::RequestKind;
+        use crate::message::response::ResponseItem;
         use crate::tokenizer_manager::wiring::TmEvent;
         use std::sync::Arc;
 
-        for stream in [false, true] {
+        // An aborted turn's tool calls are not promoted to `tool_calls`.
+        for (stream, abort) in [(false, false), (true, false), (false, true), (true, true)] {
+            let expected = if abort { "stop" } else { "tool_calls" };
             let args = Arc::new(ServerArgs {
                 served_model_name: "model".into(),
                 tool_call_parser: Some("kimi_k3".into()),
@@ -1276,8 +1380,16 @@ mod tests {
                         .unwrap()
                         .contains("lookup")
                 );
-                request.sink.try_send(chunk(request.rid.as_str(),
-                    "<|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>", true)).unwrap();
+                let mut item = chunk(
+                    request.rid.as_str(),
+                    "<|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>",
+                    true,
+                );
+                if abort && let ResponseItem::Done(output) = &mut item {
+                    output.finish_reason =
+                        Some(serde_json::from_value(serde_json::json!({"type": "abort"})).unwrap());
+                }
+                request.sink.try_send(item).unwrap();
             });
             let response = post_json(super::super::routes().with_state(state), "/v1/chat/completions", serde_json::json!({
                 "model":"model", "stream":stream,
@@ -1307,19 +1419,19 @@ mod tests {
                     ),
                     "{text}"
                 );
-                assert!(
-                    frames
-                        .iter()
-                        .any(|frame| frame["choices"][0]["finish_reason"] == "tool_calls"),
-                    "{text}"
-                );
+                let finishes: Vec<_> = frames
+                    .iter()
+                    .map(|frame| &frame["choices"][0]["finish_reason"])
+                    .filter(|reason| !reason.is_null())
+                    .collect();
+                assert_eq!(finishes, [expected], "{text}");
             } else {
                 let body = body_json(response).await;
                 assert_eq!(
                     body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup",
                     "{body}"
                 );
-                assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+                assert_eq!(body["choices"][0]["finish_reason"], expected);
             }
             responder.await.unwrap();
         }

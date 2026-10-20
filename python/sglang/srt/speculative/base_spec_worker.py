@@ -237,6 +237,9 @@ class BaseSpecWorker(ABC):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         return self.target_worker.model_runner.prewarm_sampling()
 
+    def post_capture_init(self) -> None:
+        """Runs on every rank after graph capture and KV sizing, before serving."""
+
     @property
     def preloaded_weights_bytes(self) -> int:
         if self.draft_worker is None:

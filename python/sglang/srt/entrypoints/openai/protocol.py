@@ -20,6 +20,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import (
     Annotated,
     Any,
@@ -103,6 +104,68 @@ class ErrorResponse(BaseModel):
     type: str
     param: Optional[str] = None
     code: int
+
+
+def openai_error_type(status_code: int) -> str:
+    """The OpenAI ``error.type`` for an HTTP status code."""
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 403:
+        return "permission_error"
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code == 503:
+        return "service_unavailable_error"
+    if status_code >= 500:
+        return "server_error"
+    return "invalid_request_error"
+
+
+# Routes that serve the OpenAI API (/invocations is SageMaker's chat
+# completions). Their errors use OpenAI's error envelope; SGLang's own routes
+# keep their documented error shapes, and /v1/responses keeps its own.
+OPENAI_API_ROUTES = (
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/audio/transcriptions",
+    "/v1/models",
+    "/invocations",
+)
+
+
+def is_openai_api_route(path: str) -> bool:
+    """Whether ``path`` (without the root path) serves the OpenAI API."""
+    return any(
+        path == route or path.startswith(route + "/") for route in OPENAI_API_ROUTES
+    )
+
+
+def openai_error_body(
+    message: Any,
+    status_code: int,
+    param: Optional[str] = None,
+    code: Optional[str] = None,
+) -> Dict[str, Any]:
+    """An OpenAI ``ErrorResponse`` body: ``{"error": {message, type, param, code}}``.
+
+    ``message`` is coerced to a string (an ``HTTPException.detail`` can be any
+    value); ``code`` is an OpenAI string error code (e.g. ``"model_not_found"``)
+    or None, never the HTTP status, which the response status already carries.
+    """
+    if message is None:
+        try:
+            message = HTTPStatus(status_code).phrase
+        except ValueError:
+            message = "Request failed"
+    return {
+        "error": {
+            "message": message if isinstance(message, str) else str(message),
+            "type": openai_error_type(status_code),
+            "param": param,
+            "code": code,
+        }
+    }
 
 
 @runtime_checkable
@@ -206,13 +269,30 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    """OpenAI ``usage.completion_tokens_details``."""
+
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Chat and completions set completion_tokens_details through
+        # UsageProcessor; usage built elsewhere omits the key instead of
+        # emitting null, which OpenAI does not allow.
+        if data.get("completion_tokens_details") is None:
+            data.pop("completion_tokens_details", None)
+        return data
 
 
 class StreamOptions(BaseModel):
@@ -493,7 +573,7 @@ class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     token_ids: Optional[List[int]] = None
@@ -533,7 +613,7 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     token_ids: Optional[List[int]] = None
@@ -1251,9 +1331,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
-        Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
-        ]
+        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
@@ -1313,9 +1391,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
-        Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
-        ]
+        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
     ] = None
     matched_stop: Union[None, int, str] = None
 

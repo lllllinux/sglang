@@ -62,6 +62,28 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     }
 }
 
+/// `chunk` with its completion-token delta and the request's running
+/// reasoning-token total.
+pub(super) fn with_tokens(
+    item: ResponseItem,
+    completion_tokens: u64,
+    reasoning_tokens: u64,
+) -> ResponseItem {
+    match item {
+        ResponseItem::Frame(mut output) => {
+            output.completion_tokens = completion_tokens;
+            output.reasoning_tokens = reasoning_tokens;
+            ResponseItem::Frame(output)
+        }
+        ResponseItem::Done(mut output) => {
+            output.completion_tokens = completion_tokens;
+            output.reasoning_tokens = reasoning_tokens;
+            ResponseItem::Done(output)
+        }
+        other => other,
+    }
+}
+
 /// A submitted legacy completion choice.
 pub(super) fn submitted(
     index: usize,
@@ -228,10 +250,15 @@ async fn openai_error_response_covers_unary_and_sse() {
     let unary = openai_error(StatusCode::BAD_REQUEST, "bad input", false);
     assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
     let value = body_json(unary).await;
-    assert_eq!(value["error"]["message"], "bad input");
-    assert_eq!(value["error"]["type"], "BadRequestError");
-    assert_eq!(value["error"]["code"], 400);
-    assert!(value["error"]["param"].is_null());
+    assert_eq!(
+        value,
+        json!({"error": {
+            "message": "bad input",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": null,
+        }})
+    );
 
     let streamed = openai_error(StatusCode::BAD_REQUEST, "bad input", true);
     assert_eq!(streamed.status(), StatusCode::OK);
@@ -247,7 +274,7 @@ async fn openai_error_response_covers_unary_and_sse() {
         .unwrap();
     let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
     assert_eq!(frame["error"]["message"], "bad input");
-    assert_eq!(frame["error"]["type"], "BadRequestError");
+    assert_eq!(frame["error"]["type"], "invalid_request_error");
     assert!(text.contains("[DONE]"));
 }
 
@@ -402,7 +429,7 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
         .unwrap();
     let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
     assert_eq!(frame["error"]["message"], "service unavailable");
-    assert_eq!(frame["error"]["type"], "InternalServerError");
-    assert_eq!(frame["error"]["code"], 503);
+    assert_eq!(frame["error"]["type"], "service_unavailable_error");
+    assert!(frame["error"]["code"].is_null());
     assert!(text.contains("[DONE]"));
 }

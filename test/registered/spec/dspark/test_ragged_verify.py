@@ -1,10 +1,13 @@
+import os
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    ragged_verify_token_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,6 +99,17 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
 
 
+class TestRaggedVerifyTokenRows(CustomTestCase):
+    def test_empty_rows_and_padding_tail(self):
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([2, 0, 3, 1, 0], dtype=torch.int32),
+            graph_num_tokens=9,
+        )
+        self.assertEqual(
+            ragged_verify_token_rows(layout, 9).tolist(), [0, 0, 2, 2, 2, 3, 5, 5, 5]
+        )
+
+
 class TestCaptureVerifyLens(CustomTestCase):
     def test_small_tier_one_token_rows(self):
         from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
@@ -126,6 +140,79 @@ class TestCaptureVerifyLens(CustomTestCase):
             build_capture_verify_lens(num_tokens=64, num_slots=4, num_draft_tokens=8)
         with self.assertRaises(ValueError):
             build_capture_verify_lens(num_tokens=4, num_slots=8, num_draft_tokens=8)
+
+
+class TestForcedUniformCapture(CustomTestCase):
+    WIDTH = 6
+    TIERS = [6, 12, 24, 36]
+
+    def _runner(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = 8
+        runner.captured_req_width = self.WIDTH
+        runner.capture_num_tokens = self.TIERS
+        runner.device = _DEVICE
+        runner._captured_ragged_layouts = {}
+        return runner
+
+    def test_capture_carries_full_width_layout(self):
+        from sglang.srt.speculative.ragged_verify import (
+            compute_target_verify_graph_key,
+        )
+
+        width, tiers = self.WIDTH, self.TIERS
+        runner = self._runner()
+        env = {
+            "SGLANG_RAGGED_VERIFY_MODE": "compact",
+            "SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "1",
+        }
+        with mock.patch.dict(os.environ, env):
+            # Each tier captures tier // width full-width requests. The capture
+            # carries their layout, so the attention backend records the packed
+            # (ragged) geometry that replay refreshes, keyed by token count.
+            captured = {}
+            for tier in tiers:
+                layout = runner._capture_ragged_verify_layout(tier)
+                self.assertIsNotNone(layout)
+                self.assertEqual(layout.verify_lens.tolist(), [width] * (tier // width))
+                self.assertIs(runner._captured_ragged_layouts[tier], layout)
+                key = compute_target_verify_graph_key(
+                    bs=tier // width, num_draft_tokens=width, ragged_layout=layout
+                )
+                captured[key[0]] = tier
+            for tier in tiers:
+                # Replay: one live request padded to the tier's capture slots.
+                live = RaggedVerifyLayout.from_verify_lens(
+                    verify_lens_cpu=[1],
+                    device=_DEVICE,
+                    grid=tiers,
+                    graph_num_tokens_floor=tier,
+                ).padded_to_bucket(padded_bs=tier // width)
+                key = compute_target_verify_graph_key(
+                    bs=tier // width, num_draft_tokens=width, ragged_layout=live
+                )
+                self.assertEqual(captured.get(key[0]), tier)
+
+            # Two requests of unequal length in the 12-token tier: replay stages
+            # their boundaries into the captured layout, so request 1 starts at
+            # token 3 instead of the captured 6.
+            live = RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=torch.tensor([3, 4], dtype=torch.int32),
+                graph_num_tokens=12,
+            )
+            expected = live.padded_to_bucket(padded_bs=2, cap=width)
+            runner._stage_ragged_verify_layout(live, 12)
+            layout = runner._captured_ragged_layouts[12]
+            torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
+            torch.testing.assert_close(
+                layout.qo_indptr_device, expected.qo_indptr_device
+            )
+            self.assertEqual(int(layout.qo_indptr_device[1]), 3)
 
 
 if __name__ == "__main__":

@@ -549,9 +549,9 @@ class ServingChatTestCase(CustomTestCase):
                 response = get_or_create_event_loop().run_until_complete(
                     self.chat.handle_request(request, self.fastapi_request)
                 )
-                error = json.loads(response.body)
+                error = json.loads(response.body)["error"]
                 self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
-                self.assertEqual(error["type"], "BadRequestError")
+                self.assertEqual(error["type"], "invalid_request_error")
                 self.assertIn(media_type, error["message"])
         self.tm.generate_request.assert_not_called()
 
@@ -2993,6 +2993,49 @@ class ServingChatTestCase(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
             OpenAIServingChat(tm, TemplateManager())
 
+    def test_dsv41_openai_effort_levels_map_to_budgets(self):
+        # "minimal" and "medium" are OpenAI levels the V4.1 encoder does not
+        # name; they map to budgets instead of falling back to the default.
+        from sglang.srt.entrypoints.openai import chat_encoding
+
+        expected = {
+            "minimal": 50,
+            "low": "low",
+            "medium": 62,
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+        for effort, parsed in expected.items():
+            with self.subTest(effort=effort):
+                self.assertEqual(
+                    chat_encoding.parse_dsv41_reasoning_effort(effort), parsed
+                )
+        self.assertIsNone(chat_encoding.parse_dsv41_reasoning_effort("none"))
+        for effort, budget in (("minimal", 50), ("medium", 62)):
+            with self.subTest(env_effort=effort):
+                self.assertEqual(
+                    chat_encoding.default_dsv41_reasoning_effort_from_env(effort),
+                    budget,
+                )
+
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "dsv41"
+        for effort, budget in (("minimal", 50), ("medium", 62)):
+            with self.subTest(request_effort=effort):
+                self.tm.tokenizer.encode.reset_mock()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "hi"}],
+                    reasoning_effort=effort,
+                )
+                with patch("sglang.srt.entrypoints.openai.serving_chat.logger") as log:
+                    self.chat._process_messages(request, is_multimodal=False)
+                log.warning.assert_not_called()
+                prompt = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertIn(f"Reasoning Effort: {budget} ", prompt)
+                self.assertTrue(prompt.endswith("<｜Assistant｜><think>"))
+
     def test_dsv41_rejects_image_placeholder_in_text(self):
         from sglang.srt.entrypoints.openai import encoding_dsv41
 
@@ -3209,7 +3252,8 @@ class ServingChatTestCase(CustomTestCase):
                 break
         self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertEqual(error_chunk_data["error"]["type"], "server_error")
+        self.assertIsNone(error_chunk_data["error"]["code"])
 
         # Ensure the stream stops after the abort error
         # The last chunk should be "data: [DONE]\n\n"
@@ -3292,7 +3336,8 @@ class ServingChatTestCase(CustomTestCase):
 
         error_chunk_data = json.loads(chunks[0][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertEqual(error_chunk_data["error"]["type"], "server_error")
+        self.assertIsNone(error_chunk_data["error"]["code"])
 
     def test_streaming_error_abort_still_finalizes_other_choices(self):
         """An error abort ends generation but still runs finalization, so a
@@ -3374,6 +3419,146 @@ class ServingChatTestCase(CustomTestCase):
             any(c.get("usage") is not None for c in after_error),
             "usage chunk dropped after error abort",
         )
+
+    @staticmethod
+    def _abort_result(finish_reason, text="partial"):
+        return {
+            "text": text,
+            "meta_info": {
+                "id": "chatcmpl-abort",
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": finish_reason,
+                "weight_version": "default",
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
+
+    def test_streaming_abort_without_status_reports_stop(self):
+        # OpenAI's finish_reason has no "abort"; a deliberate stop keeps its output.
+        async def _mock_generate():
+            yield self._abort_result({"type": "abort", "message": "Aborted."})
+
+        self.tm.generate_request.return_value = _mock_generate()
+        chunks = self._run_chat_stream(Mock(), self.stream_req)
+
+        self.assertNotIn('"abort"', "".join(chunks))
+        finishes = [
+            choice
+            for c in self._parse_chunks(chunks)
+            for choice in c["choices"]
+            if choice.get("finish_reason") is not None
+        ]
+        self.assertEqual(len(finishes), 1)
+        self.assertEqual(finishes[0]["finish_reason"], "stop")
+        self.assertIsNone(finishes[0]["matched_stop"])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def test_streaming_abort_with_int_status_yields_error(self):
+        # After msgpack IPC status_code is a plain int, not an HTTPStatus.
+        async def _mock_generate():
+            yield self._abort_result(
+                {"type": "abort", "status_code": 503, "message": "Queue full"}
+            )
+
+        self.tm.generate_request.return_value = _mock_generate()
+        chunks = self._run_chat_stream(Mock(), self.stream_req)
+
+        self.assertNotIn('"finish_reason": "abort"', "".join(chunks))
+        error = json.loads(chunks[0][len("data: ") :])["error"]
+        self.assertEqual(error["message"], "Queue full")
+        self.assertEqual(error["type"], "service_unavailable_error")
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def test_non_streaming_abort_with_status_returns_http_error(self):
+        # The tokenizer manager raises for 400/500/503 aborts; other statuses
+        # (EPD encoder 404/408/502/504) reach the response builder. One
+        # failed choice fails the whole request, as a raised abort does.
+        stop = self._abort_result({"type": "stop", "matched": None})
+        for status, error_type in (
+            (504, "server_error"),
+            (408, "invalid_request_error"),
+        ):
+            with self.subTest(status=status):
+                failed = self._abort_result(
+                    {
+                        "type": "abort",
+                        "status_code": status,
+                        "message": "Encoder failed",
+                    }
+                )
+
+                async def _mock_generate():
+                    yield [stop, failed]
+
+                self.tm.generate_request.return_value = _mock_generate()
+                req = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hi?"}], n=2
+                )
+                response = get_or_create_event_loop().run_until_complete(
+                    self.chat._handle_non_streaming_request(Mock(), req, Mock())
+                )
+
+                self.assertEqual(response.status_code, status)
+                self.assertEqual(
+                    json.loads(response.body),
+                    {
+                        "error": {
+                            "message": "Encoder failed",
+                            "type": error_type,
+                            "param": None,
+                            "code": None,
+                        }
+                    },
+                )
+
+    def test_abort_error_without_message_uses_the_fallback(self):
+        for message in (None, ""):
+            with self.subTest(message=message):
+                ret = [
+                    self._abort_result(
+                        {"type": "abort", "status_code": 504, "message": message}
+                    )
+                ]
+                response = self.chat._build_chat_response(
+                    self.basic_req, ret, created=123
+                )
+                self.assertEqual(response.status_code, 504)
+                self.assertEqual(
+                    json.loads(response.body)["error"]["message"],
+                    "Generation aborted.",
+                )
+
+    def test_non_streaming_abort_without_status_reports_stop(self):
+        ret = [self._abort_result({"type": "abort", "message": "Aborted."})]
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.choices[0].finish_reason, "stop")
+        self.assertIsNone(response.choices[0].matched_stop)
+        self.assertEqual(response.choices[0].message.content, "partial")
+
+    def test_non_streaming_abort_is_not_promoted_to_tool_calls(self):
+        # Only a natural stop becomes "tool_calls"; an aborted turn did not finish.
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        )
+        text = '<tool_call>\n{"name": "f", "arguments": {}}\n</tool_call>'
+        for finish_reason, expected in (
+            ({"type": "stop", "matched": None}, "tool_calls"),
+            ({"type": "abort", "message": "Aborted."}, "stop"),
+        ):
+            with self.subTest(finish_reason=finish_reason["type"]):
+                ret = [self._abort_result(dict(finish_reason), text=text)]
+                response = self.chat._build_chat_response(req, ret, created=123)
+                self.assertEqual(response.choices[0].finish_reason, expected)
+                self.assertEqual(
+                    response.choices[0].message.tool_calls[0].function.name, "f"
+                )
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
@@ -3624,6 +3809,124 @@ class ServingChatTestCase(CustomTestCase):
         self.assertFalse(
             empty_logprob_chunks,
             "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
+        )
+
+    @staticmethod
+    def _partial_stream_result():
+        return {
+            "text": "partial",
+            "meta_info": {
+                "id": "chatcmpl-stream",
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": None,
+                "weight_version": "default",
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
+
+    def _stream_that_raises(self, exc):
+        async def _mock_generate():
+            yield self._partial_stream_result()
+            raise exc
+
+        self.tm.generate_request.return_value = _mock_generate()
+        return self._run_chat_stream(Mock(), self.stream_req)
+
+    def test_streaming_unexpected_exception_ends_with_error_frame(self):
+        # Any exception after the stream started ends it with an error frame and
+        # [DONE]; the exception's text is not sent.
+        chunks = self._stream_that_raises(RuntimeError("internal detail"))
+
+        self.assertIn('"content":"partial"', "".join(chunks))
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        error = json.loads(chunks[-2][len("data: ") :])["error"]
+        self.assertEqual(
+            error,
+            {
+                "message": "Internal server error",
+                "type": "server_error",
+                "param": None,
+                "code": None,
+            },
+        )
+        self.assertNotIn("internal detail", "".join(chunks))
+
+    def test_streaming_value_error_keeps_its_message(self):
+        chunks = self._stream_that_raises(ValueError("bad request detail"))
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        error = json.loads(chunks[-2][len("data: ") :])["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["message"], "bad request detail")
+
+    def test_streaming_exception_frame_without_envelope(self):
+        # A serving that keeps the flat ErrorResponse gets a 500 frame in that shape.
+        with (
+            patch.object(self.chat, "openai_error_envelope", False),
+            self.assertLogs(level="ERROR"),
+        ):
+            try:
+                raise RuntimeError("detail")
+            except RuntimeError as e:
+                frame = json.loads(self.chat.create_streaming_exception_response(e))
+        self.assertEqual(
+            frame,
+            {
+                "error": {
+                    "object": "error",
+                    "message": "Internal server error",
+                    "type": "InternalServerError",
+                    "param": None,
+                    "code": 500,
+                }
+            },
+        )
+
+    def test_exception_before_first_chunk_is_not_streamed(self):
+        # Before HTTP 200 is sent, errors still take the HTTP error path.
+        def _raising_generate(exc):
+            async def _mock_generate():
+                raise exc
+                yield
+
+            return _mock_generate()
+
+        self.tm.generate_request.return_value = _raising_generate(
+            ValueError("context too long")
+        )
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(Mock(), self.stream_req, Mock())
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["error"]["message"], "context too long"
+        )
+
+        # Any other exception reaches handle_request's catch-all: a 500.
+        self.tm.generate_request.return_value = _raising_generate(
+            RuntimeError("internal detail")
+        )
+        with patch.object(
+            self.chat,
+            "_convert_to_internal_request",
+            return_value=(Mock(), self.stream_req),
+        ):
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(self.stream_req, Mock())
+            )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            json.loads(response.body)["error"],
+            {
+                "message": "Internal server error",
+                "type": "server_error",
+                "param": None,
+                "code": None,
+            },
         )
 
     def test_non_streaming_extension_fields_emit_sglext_without_meta_info(self):

@@ -649,12 +649,22 @@ def index_k_rope_pack(
 @triton.jit
 def _e2m1_decode(code):
     # code: uint 0..15 -> e2m1 value. exp = bits 2..1, mantissa = bit 0, sign = bit 3.
+    # |v| = 0, 0.5, 1, 1.5, 2, 3, 4, 6.
     e = (code >> 1) & 3
     m = (code & 1).to(tl.float32)
-    sub = m * 0.5
-    nor = (1.0 + m * 0.5) * tl.exp2((e - 1).to(tl.float32))
-    v = tl.where(e == 0, sub, nor)
+    pow2 = tl.where(e == 3, 4.0, tl.where(e == 2, 2.0, 1.0))
+    v = tl.where(e == 0, m * 0.5, (1.0 + m * 0.5) * pow2)
     return tl.where((code >> 3) == 1, -v, v)
+
+
+@triton.jit
+def _e8m0_decode(code):
+    # code: uint 0..255 -> 2^(code - 127), written directly as the FP32 exponent
+    # field. The scorer only sees codes 1..254: the quantizer clamps to that range
+    # and masked loads use 127. Code 0 gives 0 and 255 gives inf here, unlike
+    # _ue8m0_to_fp32 in dequant_k_cache.py, which follows torch.float8_e8m0fnu
+    # (2^-127 and NaN).
+    return (code.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -700,7 +710,7 @@ def _fp4_index_logits_tile(
         mask=valid[:, None],
         other=127,
     )
-    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    scale = _e8m0_decode(exps)
     k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
     k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
 
@@ -881,6 +891,157 @@ def _fp4_index_logits_paged_kernel(
             HALF_D,
         )
         tl.store(out_ptr + b * out_stride + offs_l, logit, mask=offs_l < L)
+
+
+@triton.jit
+def _neg_inf_visible_kernel(out_ptr, lens_ptr, L, out_stride, BLOCK: tl.constexpr):
+    b = tl.program_id(0)
+    n_vis = tl.minimum(tl.load(lens_ptr + b), L)
+    for start in range(tl.program_id(1) * BLOCK, n_vis, tl.num_programs(1) * BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        tl.store(out_ptr + b * out_stride + offs, float("-inf"), mask=offs < n_vis)
+
+
+@triton.jit
+def _fp4_index_logits_candidates_kernel(
+    q_ptr,
+    w_ptr,
+    req_ptr,
+    req_table_ptr,
+    lens_ptr,
+    table_ptr,
+    blocks_ptr,
+    out_ptr,
+    L,
+    num_blocks,
+    page_size,
+    row_stride,
+    req_stride,
+    blocks_stride,
+    out_stride,
+    stride_qb,
+    stride_qh,
+    stride_wb,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    RATIO: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 8
+    BLOCKS_PER_TILE: tl.constexpr = 8
+    b = tl.program_id(0)
+    n_vis = tl.minimum(tl.load(lens_ptr + b), L)
+    req = tl.load(req_ptr + b).to(tl.int64)
+    TILE: tl.constexpr = BLOCKS_PER_TILE * BLOCK_SIZE
+    offs = tl.arange(0, TILE)
+    which = offs // BLOCK_SIZE
+    within = offs % BLOCK_SIZE
+    for c in range(
+        tl.program_id(1) * BLOCKS_PER_TILE,
+        num_blocks,
+        tl.num_programs(1) * BLOCKS_PER_TILE,
+    ):
+        blk = tl.load(
+            blocks_ptr + b * blocks_stride + c + which,
+            mask=c + which < num_blocks,
+            other=-1,
+        )
+        pos = blk * BLOCK_SIZE + within
+        valid = (blk >= 0) & (pos < n_vis)
+        if tl.max(valid.to(tl.int32), axis=0) > 0:
+            pos = tl.where(valid, pos, 0)
+            slot = (
+                tl.load(
+                    req_table_ptr + req * req_stride + pos * RATIO, mask=valid, other=0
+                ).to(tl.int64)
+                // RATIO
+            )
+            logit = _fp4_index_logits_tile(
+                q_ptr,
+                w_ptr,
+                table_ptr,
+                b,
+                slot,
+                valid,
+                page_size,
+                row_stride,
+                stride_qb,
+                stride_qh,
+                stride_wb,
+                H,
+                HALF_D,
+            )
+            tl.store(out_ptr + b * out_stride + pos, logit, mask=valid)
+
+
+def fp4_index_logits_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    req: torch.Tensor,
+    req_table: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+    max_len: int,
+    ratio: int,
+    blocks: torch.Tensor,
+) -> torch.Tensor:
+    """Score 8-position candidate ``blocks`` ([batch, n] IDs, -1 padded).
+
+    Returns [batch, max_len] FP32 scores, -inf outside the candidates within the
+    visible range. Positions beyond the visible range are uninitialized.
+    """
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    assert table.dtype == torch.uint8 and table.ndim == 2
+    assert ratio in (1, 2) and max_len <= req_table.shape[1] // ratio
+    assert req_table.stride(1) == 1 and blocks.dim() == 2
+    batch, heads, _ = q.shape
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    req = req.contiguous()
+    lens = lens.contiguous()
+    blocks = blocks.contiguous()
+    # The same row alignment as fp4_index_logits_paged.
+    out = aligned_new_empty(
+        shape=(batch, max_len),
+        dtype=torch.float32,
+        device=q.device,
+        alignment_bytes=get_input_stride_alignment_bytes(),
+    )
+    if not batch or not max_len:
+        return out
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    fill_workers = min(triton.cdiv(max_len, 4096), triton.cdiv(num_sms * 2, batch))
+    _neg_inf_visible_kernel[(batch, fill_workers)](
+        out, lens, max_len, out.stride(0), BLOCK=4096, num_warps=4
+    )
+    workers = max(
+        1, min(triton.cdiv(blocks.shape[1], 8), triton.cdiv(num_sms * 4, batch))
+    )
+    _fp4_index_logits_candidates_kernel[(batch, workers)](
+        q,
+        weights,
+        req,
+        req_table,
+        lens,
+        table,
+        blocks,
+        out,
+        max_len,
+        blocks.shape[1],
+        page_size,
+        table.stride(0),
+        req_table.stride(0),
+        blocks.stride(0),
+        out.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        H=heads,
+        HALF_D=INDEX_HEAD_DIM // 2,
+        RATIO=ratio,
+        num_warps=4,
+    )
+    return out
 
 
 def fp4_index_logits_paged(

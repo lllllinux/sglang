@@ -5,13 +5,14 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Generator, Iterator, List, Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    fp4_index_logits_candidates,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -21,6 +22,15 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_budget_bytes,
+    mqa_logits_needs_budget_check,
+    mqa_logits_static_budget_bytes,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
@@ -30,9 +40,26 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+
+
+def prefill_score_budget_bytes(
+    *, num_rows: int, max_seq_len: int, device: torch.device
+) -> int:
+    """Budget for logits and declared scratch; skip the free-memory query for
+    small or captured forwards."""
+    cap = _DEEP_GEMM_SCORE_BUDGET_BYTES
+    if not mqa_logits_needs_budget_check(num_rows=num_rows, num_cols=max_seq_len):
+        return cap
+    # Not get_is_capture_mode(): breakable-graph replay runs this eagerly and
+    # can afford the free-memory query.
+    if (
+        capture_mode.is_capture_mode
+        or torch.cuda.is_current_stream_capturing()
+        or is_in_tc_piecewise_cuda_graph()
+    ):
+        return min(cap, mqa_logits_static_budget_bytes(device_index=device.index))
+    return min(cap, mqa_logits_budget_bytes(device_index=device.index, allow_sync=True))
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -54,6 +81,8 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     q_fp4: torch.Tensor  # [rows, heads, 64] int8, packed fp4
     q_sf: torch.Tensor  # [rows, heads] int32, packed ue8m0
     weights: torch.Tensor  # [rows, heads] fp32 head weights
+    # This forward's prefill_score_budget_bytes; None takes the fixed cap.
+    score_budget_bytes: Optional[int] = None
 
     @property
     def num_rows(self) -> int:
@@ -204,10 +233,19 @@ def get_deep_gemm_prefill_data(
         q_fp4=q_fp4,
         q_sf=q_sf,
         weights=weights,
+        score_budget_bytes=inputs.score_budget_bytes,
     )
 
 
-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
+def score_tiles(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    scratch_bytes: Callable[[int], Tuple[int, int]] = lambda width: (0, 0),
+) -> Generator[Tuple[slice, torch.Tensor], None, None]:
+    budget = _DEEP_GEMM_SCORE_BUDGET_BYTES
+    if data.score_budget_bytes is not None:
+        budget = min(budget, data.score_budget_bytes)
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
@@ -215,7 +253,8 @@ def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=budget,
+        scratch_bytes=scratch_bytes,
     )
 
 
@@ -371,8 +410,9 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     """Paged decode scores with graph-stable capacity ``lmax``.
 
     Only positions below each device-side ``lens`` are initialized. Top-k
-    consumers must respect those lengths. With ``has_candidate_mask``, masked
-    positions have -inf scores and must be discarded during selection writeback.
+    consumers must respect those lengths. With ``has_candidate_mask``, visible
+    positions outside the candidate blocks have -inf scores and must be discarded
+    during selection writeback.
     """
 
     bs: int
@@ -391,15 +431,16 @@ def decode_scores(
     inputs: DecodeInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
-    candidate_mask: Optional[torch.Tensor] = None,
+    candidate_blocks: Optional[torch.Tensor] = None,
     compute_topk_plan: bool = True,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
-    """None when there is no row, or nothing visible yet."""
+    """None when there is no row, or nothing visible yet. The paged path scores
+    only ``candidate_blocks`` when given; the dense path ignores them."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    paged = get_platform().is_sm90
+    paged = get_platform().is_sm90 or get_platform().is_sm120
     bs = req.shape[0]
     assert pos.shape[0] == bs, (
         f"decode expects one token per request, {pos.shape=} {bs=}"
@@ -422,18 +463,12 @@ def decode_scores(
         lens = lens.to(torch.int32)
         # Prepare the device-side plan before scoring, away from its top-k consumer.
         plan = plan_topk_v2(lens) if compute_topk_plan else None
-        scores = fp4_index_logits_paged(
-            q,
-            weights,
-            req,
-            req_to_token,
-            lens,
-            table,
-            table.shape[1] // 68,
-            lmax,
-            ratio,
-            candidate_mask,
-        )
+        page_size = table.shape[1] // 68
+        args = (q, weights, req, req_to_token, lens, table, page_size, lmax, ratio)
+        if candidate_blocks is None:
+            scores = fp4_index_logits_paged(*args)
+        else:
+            scores = fp4_index_logits_candidates(*args, candidate_blocks)
         return PagedDecodeScores(
             bs=bs,
             lmax=lmax,
@@ -443,7 +478,7 @@ def decode_scores(
             req_to_token=req_to_token,
             ratio=ratio,
             plan=plan,
-            has_candidate_mask=candidate_mask is not None,
+            has_candidate_mask=candidate_blocks is not None,
         )
     inputs.reset_outputs()
     j = torch.arange(lmax, device=pos.device)

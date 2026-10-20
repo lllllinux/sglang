@@ -53,6 +53,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.speculative.ragged_verify import (
+    ragged_verify_token_rows,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -353,12 +357,22 @@ class EngramHasher(nn.Module):
             kmode = MODE_DECODE
             commit_rows, commit_last = req_slots, None
         elif mode.is_target_verify():
-            block = int(forward_batch.spec_info.draft_token_num)
-            assert num_tokens == bs * block, (
-                "engram target-verify expects one equal block per request, got "
-                f"{num_tokens} tokens for {bs} requests of {block}"
-            )
-            kmode = MODE_VERIFY
+            layout = resolve_ragged_verify_layout(forward_batch)
+            if layout is None:
+                block = int(forward_batch.spec_info.draft_token_num)
+                assert num_tokens == bs * block, (
+                    "engram target-verify expects one equal block per request, got "
+                    f"{num_tokens} tokens for {bs} requests of {block}"
+                )
+                kmode = MODE_VERIFY
+            else:
+                # Packed (compact) verify: each request's run starts at its
+                # qo_indptr entry. Graph padding hashes with the row the layout
+                # gives it (the tail with the last row); padding outputs are
+                # discarded and verify commits no history.
+                row = ragged_verify_token_rows(layout, num_tokens).clamp_max(bs - 1)
+                starts = layout.qo_indptr_device[:-1]
+                kmode = MODE_EXTEND
             commit_rows = commit_last = None
         else:
             assert mode.is_extend(), (
@@ -857,11 +871,20 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        from sglang.srt.model_loader.weight_utils import SafetensorsRowSource
+
         rows = slice(self.row_start, self.row_start + self.rows)
-        if self._shared:
-            param.data[rows].copy_(loaded_weight[rows])
+        dst = param.data[rows] if self._shared else param.data
+        if isinstance(loaded_weight, SafetensorsRowSource):
+            # Page-cache eviction was measured with the per-rank layout only.
+            loaded_weight.read_rows_into(
+                dst,
+                self.row_start,
+                drop_page_cache=self.host_table is not None
+                and self.host_table.layout == "per_rank",
+            )
         else:
-            param.data.copy_(loaded_weight[rows])
+            dst.copy_(loaded_weight[rows])
         if self.host_table is not None:
             self.host_table.dirty = True
 

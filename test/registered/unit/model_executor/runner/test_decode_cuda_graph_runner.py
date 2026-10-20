@@ -23,6 +23,7 @@ lightweight stand-in (with the real precedence helper bound) so no model or
 server is constructed.
 """
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -46,7 +47,7 @@ _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
 def _make_fake_self(capture_bs):
     """Stand-in ``self`` with the real precedence helper bound so the env-var
     gating in ``_init_profile_context_and_memory_record`` applies."""
-    fake_self = SimpleNamespace(capture_bs=list(capture_bs))
+    fake_self = SimpleNamespace(capture_bs=list(capture_bs), ragged_verify_mode=False)
     fake_self._graph_batch_capture_active = (
         DecodeCudaGraphRunner._graph_batch_capture_active.__get__(fake_self)
     )
@@ -58,6 +59,7 @@ def _make_fake_self(capture_bs):
     fake_self._profile_runner_name = DecodeCudaGraphRunner._profile_runner_name.__get__(
         fake_self
     )
+    fake_self._capture_shapes = DecodeCudaGraphRunner._capture_shapes.__get__(fake_self)
     return fake_self
 
 
@@ -403,6 +405,146 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
                     layout.qo_indptr_device, expected.qo_indptr_device
                 )
                 torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
+
+
+class _RaggedVerifyRunner(DecodeCudaGraphRunner):
+    """Compact ragged-verify target runner; capture_one_shape records its calls."""
+
+    def capture_one_shape(self, size, forward, *args, capture_num_tokens=None):
+        self.captured.append((size, capture_num_tokens))
+
+
+class _DraftRunner(DecodeCudaGraphRunner):
+    """Like the speculative draft runners: builds its own state without
+    DecodeCudaGraphRunner.__init__ and overrides capture_one_shape with the
+    original signature."""
+
+    def capture_one_shape(
+        self, size, forward, stream_idx=None, variant_label=None, attention_variant=None
+    ):
+        self.captured.append(size)
+
+
+def _bare_runner(cls, *, capture_bs, width=6, max_bs=4):
+    runner = cls.__new__(cls)
+    runner.capture_bs = list(capture_bs)
+    runner.compile_bs = []
+    runner.captured_req_width = width
+    runner.max_bs = max_bs
+    runner.record_nolora_graph = False
+    runner.attention_graph_variants = None
+    runner.model_runner = SimpleNamespace(device="cuda", gpu_id=0, model=None)
+    runner.captured = []
+    return runner
+
+
+class TestSubWidthTiers(CustomTestCase):
+    """SGLANG_RAGGED_VERIFY_SUB_WIDTH_TIERS adds ragged-verify token tiers below one
+    request's width, so a single request can verify fewer than gamma + 1 tokens."""
+
+    def _env(self, sub_width, force_uniform="0"):
+        return mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_RAGGED_VERIFY_SUB_WIDTH_TIERS": sub_width,
+                "SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": force_uniform,
+            },
+        )
+
+    def _ragged_runner(self, sub_width, *, alignment=1, capture_bs=(1, 2, 4)):
+        runner = _bare_runner(_RaggedVerifyRunner, capture_bs=capture_bs)
+        runner.ragged_verify_mode = True
+        with (
+            self._env(sub_width),
+            mock.patch.object(
+                mod, "get_cuda_graph_batch_size_alignment", return_value=alignment
+            ),
+        ):
+            runner.capture_num_tokens = runner._build_ragged_verify_token_buckets()
+        return runner
+
+    def _capture(self, runner):
+        with (
+            self._env("0"),
+            mock.patch.object(mod, "get_available_gpu_memory", return_value=1.0),
+            mock.patch.object(
+                mod,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=1, tp_group=None),
+            ),
+            mock.patch.object(
+                mod.torch_compile_decoration,
+                "patch_model",
+                side_effect=lambda model, *a, **k: contextlib.nullcontext(model),
+            ),
+        ):
+            runner._capture_one_stream()
+        return runner.captured
+
+    def test_token_tiers(self):
+        self.assertEqual(self._ragged_runner("0").capture_num_tokens, [6, 12, 24])
+        self.assertEqual(
+            self._ragged_runner("1").capture_num_tokens, [1, 2, 3, 4, 5, 6, 12, 24]
+        )
+        # Sub-width tiers keep the token alignment the width tiers' batch sizes have.
+        self.assertEqual(
+            self._ragged_runner("1", alignment=4).capture_num_tokens, [4, 6, 12, 24]
+        )
+
+    def test_rejects_forced_uniform_capture(self):
+        runner = _bare_runner(_RaggedVerifyRunner, capture_bs=(1, 2))
+        with self._env("1", force_uniform="1"), self.assertRaises(ValueError):
+            runner._build_ragged_verify_token_buckets()
+
+    def test_capture_loop_captures_every_sub_width_tier(self):
+        # Width tiers by batch size first, then each sub-width tier with
+        # min(tokens, max_bs) request slots and its token count.
+        self.assertEqual(
+            self._capture(self._ragged_runner("1")),
+            [(4, None), (2, None), (1, None), (4, 5), (4, 4), (3, 3), (2, 2), (1, 1)],
+        )
+        self.assertEqual(
+            self._capture(self._ragged_runner("0")), [(4, None), (2, None), (1, None)]
+        )
+
+    def test_runner_without_ragged_state_keeps_capturing_batch_sizes(self):
+        runner = _bare_runner(_DraftRunner, capture_bs=(1, 2, 4))
+        self.assertEqual(self._capture(runner), [4, 2, 1])
+
+    def test_capture_profile_names_every_capture(self):
+        runner = self._ragged_runner("1", capture_bs=(1, 2))
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"SGLANG_TORCH_PROFILER_DIR": tmp, _BATCH_CAPTURE: "1"},
+                ),
+                mock.patch.object(
+                    mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+                ),
+                mock.patch.object(mod, "profile") as mock_profile,
+                mock.patch("torch.profiler.schedule"),
+                mock.patch("torch.cuda.memory._record_memory_history"),
+            ):
+                os.environ.pop(_CAPTURE_TRACE, None)
+                runner._init_profile_context_and_memory_record()
+            on_trace_ready = mock_profile.call_args.kwargs["on_trace_ready"]
+            # The capture loop tags each shape before capturing it.
+            runner._profiler = mock.Mock()
+            names = []
+            for bs, tokens in runner._capture_shapes():
+                runner._set_profile_trace_tag(bs, None, None, None, tokens=tokens)
+                prof = mock.Mock()
+                prof.export_chrome_trace.side_effect = lambda p: names.append(
+                    os.path.basename(p)
+                )
+                on_trace_ready(prof)
+        runner_name = type(runner).__name__
+        self.assertEqual(
+            names,
+            [f"{runner_name}_{label}_rank0.json.gz" for label in ("bs_2", "bs_1")]
+            + [f"{runner_name}_tokens_{n}_rank0.json.gz" for n in (5, 4, 3, 2, 1)],
+        )
 
 
 if __name__ == "__main__":

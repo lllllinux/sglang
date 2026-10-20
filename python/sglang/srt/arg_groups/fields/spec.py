@@ -106,6 +106,24 @@ class Spec(msgspec.Struct):
         "it into extra real verification at the same step time. Off by default; when "
         "off the schedule is byte-for-byte unchanged.",
     ] = False
+    speculative_dspark_sps_autotune: A[
+        str,
+        Arg(
+            help="DSPARK compact ragged-verify only. Fit the SPS cost table at "
+            "startup, before the server is ready, from real decode steps: for "
+            "sampled batch sizes and their reachable verify tiers, the verify "
+            "budget is pinned to the tier and synthetic requests run until "
+            "enough steady steps are timed (the dspark_sps_profiler method). "
+            "'auto' loads a table cached for the same configuration, and "
+            "measures and caches one otherwise; "
+            "--speculative-dspark-sps-table-path takes precedence. 'force' "
+            "measures even with a configured table or cache. Measurement runs "
+            "only during HTTP server startup. A failed measurement keeps the "
+            "configured table once the schedulers confirm its end; otherwise "
+            "the server does not start. 'off' (default) disables it.",
+            choices=["off", "auto", "force"],
+        ),
+    ] = "off"
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

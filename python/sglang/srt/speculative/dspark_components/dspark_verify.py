@@ -138,6 +138,9 @@ class TargetVerifyExecutor:
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
         self._simulated_correct_len = simulated_correct_len
+        # Set while the SPS autotune measures: every step commits only its
+        # bonus token, whatever the drafts would have accepted.
+        self.bonus_only = False
 
     def accept_and_finalize(
         self,
@@ -153,6 +156,7 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        compact_padding: bool = False,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -164,7 +168,7 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        simulate = self._simulated_correct_len is not None
+        simulate = self._simulated_correct_len is not None or self.bonus_only
         # Simulated acceptance overwrites correct_len below, so a sampling accept
         # (draft/target softmax + rejection) would be computed only to be discarded.
         accept_sampling_info = None if simulate and _is_hip else sampling_info
@@ -179,7 +183,44 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
+            compact_padding=compact_padding,
         )
+        simulated_correct_len = self._simulated_correct_len
+        if self.bonus_only:
+            real_correct_len = correct_len
+            correct_len = torch.zeros_like(correct_len)
+            # The bonus-only length replaces any SGLANG_SIMULATE_ACC_LEN one.
+            simulated_correct_len = None
+            if (
+                simulate_bonus_sampling_info is None
+                and verify_ids_2d.shape[1] > 1
+                and (
+                    accept_sampling_info is sampling_info
+                    or sampling_info is None
+                    or sampling_info.is_all_greedy
+                )
+            ):
+                # Commit the token the real accept produced at row 0: the first
+                # draft if it was accepted, otherwise the target's resample there.
+                # Either way it follows the request's own sampling (top-p/top-k
+                # included) and needs no extra sampling pass.
+                bonus = torch.where(
+                    real_correct_len.view_as(bonus) > 0,
+                    verify_ids_2d[:, 1].to(bonus.dtype).view_as(bonus),
+                    bonus,
+                )
+            elif simulate_bonus_sampling_info is None:
+                simulate_bonus_sampling_info = sampling_info
+            if simulate_bonus_sampling_info is not None:
+                bonus = sample_simulated_bonus(
+                    target_logits=target_logits,
+                    correct_len=correct_len,
+                    greedy_bonus=bonus,
+                    sampling_info=simulate_bonus_sampling_info,
+                    bs=bs,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                )
+            simulate_bonus_sampling_info = None
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
             if accept_sampling_info is None or accept_sampling_info.is_all_greedy
@@ -195,7 +236,7 @@ class TargetVerifyExecutor:
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
             sync_site=sync_site,
-            simulated_correct_len=self._simulated_correct_len,
+            simulated_correct_len=simulated_correct_len,
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
@@ -409,7 +450,10 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
+        if (
+            seq_lens_cpu_backup is not None
+            and not self._verify_backend_self_adds_seq_lens()
+        ):
             verify_lens_cpu = (
                 layout.verify_lens_cpu
                 if layout.verify_lens_cpu is not None
@@ -671,7 +715,9 @@ class DsparkVerifyEpilogue:
             state_slot=state_slot,
         )
 
-    def read_accept(self, bs: int) -> AcceptOuts:
+    def _accept_buffers(self, bs: int) -> AcceptOuts:
+        # Views of the static buffers: the in-graph accept (_accept) must write
+        # these, not read_accept's copies, or a replay never updates them.
         return AcceptOuts(
             correct_len=self.correct_len_buf[:bs],
             bonus=self.bonus_buf[:bs],
@@ -679,6 +725,23 @@ class DsparkVerifyEpilogue:
             commit_lens=self.commit_lens_buf[:bs],
             new_seq_lens=self.new_seq_lens_buf[:bs],
             out_tokens=self.out_tokens_buf[:bs],
+        )
+
+    def read_accept(self, bs: int) -> AcceptOuts:
+        # These buffers are rewritten by the next target-verify graph replay.
+        # Under the overlap scheduler the result D2H (accept lens / next token
+        # ids) runs on copy_stream, which forward_stream never waits on, so a
+        # copy that runs late would read step N+1's values -- per rank, so TP
+        # ranks could commit different token counts. Return allocator-owned
+        # copies made here, right after the replay; async_d2h's record_stream
+        # keeps them alive until the copy has run.
+        return AcceptOuts(
+            correct_len=self.correct_len_buf[:bs].clone(),
+            bonus=self.bonus_buf[:bs].clone(),
+            cap_trim_lens=self.cap_trim_lens_buf[:bs].clone(),
+            commit_lens=self.commit_lens_buf[:bs].clone(),
+            new_seq_lens=self.new_seq_lens_buf[:bs].clone(),
+            out_tokens=self.out_tokens_buf[:bs].clone(),
         )
 
     @property
@@ -796,7 +859,7 @@ class DsparkVerifyEpilogue:
             tp_sync=self._tp_sync,
             sync_site=SpecTpSyncSite.DSPARK_ACCEPT_GRAPH,
             simulated_correct_len=self.simulated_correct_len,
-            out=self.read_accept(bs),
+            out=self._accept_buffers(bs),
         )
         return accept.commit_lens
 
@@ -924,6 +987,17 @@ def sample_simulated_bonus(
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 
 
+def _may_have_padding_rows(
+    layout: Optional[RaggedVerifyLayout], verify_num_draft_tokens: int
+) -> bool:
+    # Host-side lengths avoid a sync; without them, assume padding.
+    if layout is None:
+        return False
+    if layout.verify_lens_cpu is None:
+        return True
+    return min(layout.verify_lens_cpu) < verify_num_draft_tokens
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -936,6 +1010,7 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
     block_verification: bool = False,
+    compact_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -965,6 +1040,13 @@ def accept_draft_tokens(
             rows_per_request=gamma_rows,
         ).view(bs, gamma_rows, vocab)
         expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    padding_verify_lens = (
+        cutoff_verify_lens
+        if compact_padding
+        and verify_logits_adjustments_are_noop(sampling_info)
+        and _may_have_padding_rows(cutoff_layout, verify_num_draft_tokens)
+        else None
+    )
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
             candidates=candidates,
@@ -976,6 +1058,7 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            padding_verify_lens=padding_verify_lens,
         )
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
@@ -994,6 +1077,7 @@ def accept_draft_tokens(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         block_verification=block_verification,
+        padding_verify_lens=padding_verify_lens,
     )
     selected = SelectMixedAccept.execute(
         greedy_mask=greedy_mask,

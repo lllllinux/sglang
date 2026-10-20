@@ -102,6 +102,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     ScoringRequest,
     TokenizeRequest,
     V1RerankReqInput,
+    is_openai_api_route,
+    openai_error_body,
 )
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -414,6 +416,12 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
+    from sglang.srt.speculative.dspark_components.dspark_sps_autotune import (
+        run_startup_autotune,
+    )
+
+    await run_startup_autotune(_global_state.tokenizer_manager)
+
     # Start the native gRPC server and warmup inside the try so a failure in
     # either still runs the finally cleanup below. Native gRPC is enabled via
     # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
@@ -518,6 +526,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_platform,
     get_serving,
     publish,
 )
@@ -562,6 +571,11 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
     )
 
 
+def _is_openai_api_request(request: Request) -> bool:
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    return is_openai_api_route(route_path)
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
@@ -569,6 +583,7 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     For /v1/responses, emit OpenAI-style nested error envelope:
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
+    For other routes the OpenAI API defines, emit OpenAI's error envelope.
     """
     if request.url.path.startswith("/v1/messages"):
         # Map HTTP status to Anthropic error.type; fall back to api_error.
@@ -609,6 +624,12 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             content={"error": nested_error}, status_code=exc.status_code
         )
 
+    if _is_openai_api_request(request):
+        return ORJSONResponse(
+            content=openai_error_body(exc.detail, exc.status_code),
+            status_code=exc.status_code,
+        )
+
     error = ErrorResponse(
         object="error",
         message=exc.detail,
@@ -627,7 +648,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     file paths or Python internals from the default ``str(exc)`` representation
     never reach the client. For /v1/responses, keep OpenAI-style. For
     /v1/systemone, keep the 422 detail list that the System One API documents.
-    Otherwise use the legacy ErrorResponse shape.
+    For other routes the OpenAI API defines, use OpenAI's error envelope;
+    otherwise the legacy ErrorResponse shape.
     """
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
@@ -666,6 +688,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "code": HTTPStatus.BAD_REQUEST.value,
         }
         return ORJSONResponse(status_code=400, content={"error": nested_error})
+
+    if _is_openai_api_request(request):
+        return ORJSONResponse(
+            status_code=400,
+            content=openai_error_body(message, HTTPStatus.BAD_REQUEST.value),
+        )
 
     err = ErrorResponse(
         message=message,
@@ -1891,11 +1919,11 @@ async def openai_v1_audio_transcriptions(
     """OpenAI-compatible audio transcription endpoint."""
     if response_format not in ["json", "text", "verbose_json"]:
         return ORJSONResponse(
-            content={
-                "error": {
-                    "message": "Only 'json', 'text', and 'verbose_json' formats supported"
-                }
-            },
+            content=openai_error_body(
+                "Only 'json', 'text', and 'verbose_json' formats supported",
+                400,
+                param="response_format",
+            ),
             status_code=400,
         )
 
@@ -1966,14 +1994,12 @@ async def retrieve_model(model: str):
     if model not in served_model_names:
         return ORJSONResponse(
             status_code=404,
-            content={
-                "error": {
-                    "message": f"The model '{model}' does not exist",
-                    "type": "invalid_request_error",
-                    "param": "model",
-                    "code": "model_not_found",
-                }
-            },
+            content=openai_error_body(
+                f"The model '{model}' does not exist",
+                404,
+                param="model",
+                code="model_not_found",
+            ),
         )
 
     return ModelCard(
@@ -2287,6 +2313,20 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _warmup_with_image(model_info: dict) -> bool:
+    return (
+        bool(model_info.get("has_image_understanding", False))
+        and not get_disagg().language_only
+        and not get_disagg().language_model_only
+        # Encoder SWA bounded replay serves image requests on CUDA only.
+        and (
+            not get_exec().features.enable_encoder_swa_bounded_replay
+            or get_platform().is_cuda
+        )
+        and not is_mps()
+    )
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2320,13 +2360,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
     # A language-only worker may advertise VLM capability for encoder
     # disaggregation, but its local warmup must stay on the text path.
-    is_vlm = (
-        bool(model_info.get("has_image_understanding", False))
-        and not get_disagg().language_only
-        and not get_disagg().language_model_only
-        and not get_exec().features.enable_encoder_swa_bounded_replay
-        and not is_mps()
-    )
+    is_vlm = _warmup_with_image(model_info)
     if model_info["is_generation"]:
         if is_vlm and not get_serving().skip_tokenizer_init:
             request_name = "/v1/chat/completions"

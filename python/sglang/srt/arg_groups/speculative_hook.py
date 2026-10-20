@@ -813,6 +813,15 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
             "will be a no-op."
         )
+    if (
+        cfg.speculative_dspark_sps_autotune != "off"
+        and ragged_mode is not RaggedVerifyMode.COMPACT
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-autotune only takes effect with "
+            "SGLANG_RAGGED_VERIFY_MODE=compact (got %r); it will be a no-op.",
+            ragged_mode.value,
+        )
 
 
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:

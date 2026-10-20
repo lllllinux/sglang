@@ -373,6 +373,37 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.bf16_skinny_gemm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.bf16_skinny_gemm:bf16_skinny_gemm",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.quantize_wo_a_fp8",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:quantize_wo_a_fp8",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_fp8_small_batch",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_fp8_small_batch",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_fp8_small_batch_mxfp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_fp8_small_batch_mxfp8",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
@@ -428,6 +459,14 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
         ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_mxfp8_skinny_gemm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.sm120_mxfp8_skinny_gemm:mxfp8_skinny_gemm",
+        capabilities=_SM120,
     )
 )
 register_kernel(
